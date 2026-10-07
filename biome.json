@@ -6,7 +6,12 @@
 		"useIgnoreFile": true
 	},
 	"files": {
-		"includes": ["**/*.ts", "**/*.mjs", "**/*.json"]
+		"includes": [
+			"**/*.ts",
+			"**/*.mjs",
+			"**/*.json",
+			"!.release-please-manifest.json"
+		]
 	},
 	"assist": {
 		"actions": {
