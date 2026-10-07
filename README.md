@@ -10,7 +10,8 @@ returns shaped, typed rows.
 - Database-neutral definitions: dialects plug in through the `Dialect` interface, and Postgres
   ships today (`measurr/postgres`).
 - Tenant-scoped by construction: the engine adds the tenant filter to every statement and
-  refuses to run without a tenant.
+  refuses to run without a tenant. Platform admins can query every tenant only through an
+  explicit `allTenants` value that no query input can carry.
 - The query schema is generated with Zod, so it doubles as an LLM tool schema
   (`z.toJSONSchema`) and as the request validator. It can be built per caller, offering only
   the datasets they may query.
@@ -149,6 +150,38 @@ ${analyticsToolGuidance}`
 `{ dataset, durationMs, rows, outcome: 'success' | 'error', error? }`. `dataset` is null when
 the input named no known dataset, so free text from a model never becomes a metric label.
 What the hook throws or rejects with is swallowed; it cannot fail a query.
+
+## Tenants and platform admins
+
+`tenant(ctx)` decides the scope of every statement, including the lookups that resolve filter
+labels. It returns a tenant id, or `allTenants` to drop the tenant filter for a caller allowed
+to see every tenant. Anything else (null, undefined, `''`, any other value) is refused with
+`AnalyticsError('missing_tenant')`, so a missing organization never widens a query.
+
+The scope comes only from `ctx`, which your server builds from the session. `allTenants` is a
+symbol, so a query (JSON, a model's tool call) cannot carry it. A discriminated context keeps
+the rule in one typed place:
+
+```ts
+import { allTenants } from 'measurr'
+
+type Ctx =
+	// A super admin may narrow to one organization, or see all of them.
+	| { role: 'superAdmin'; organizationId?: OrganizationId }
+	// Everyone else is always scoped to the organization they are signed in to.
+	| { role: 'member'; organizationId: OrganizationId }
+
+const analytics = createAnalytics({
+	// ...
+	tenant: (ctx: Ctx) =>
+		ctx.role === 'superAdmin' ? (ctx.organizationId ?? allTenants) : ctx.organizationId
+})
+```
+
+Resolve a super admin's optional organization id on the server (from the request, after
+checking the session) before building `ctx`; never read it from the query input. Unscoped
+lookups resolve labels across tenants, so `"Complaint"` matches every tenant's tag of that
+name.
 
 ## The model
 
@@ -301,7 +334,7 @@ empty tenant sees nothing (tenant isolation), and day buckets in a far-from-UTC 
 
 ## Stable API
 
-Kept stable for publishing: `createAnalytics` and its options, `analytics.query`,
+Kept stable for publishing: `createAnalytics` and its options, `allTenants`, `analytics.query`,
 `explain`, `querySchema`, `resultSchema`, `listDatasets`; `AnalyticsResultSchema`,
 `analyticsToolGuidance`, `AnalyticsQueryEvent`; `defineDataset`, `measure.*`,
 `dimension.*`, `table` / `Table`, the expression builders; the `Dialect`, `SqlRenderer` and

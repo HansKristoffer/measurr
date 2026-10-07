@@ -5,6 +5,8 @@ import {
 	type NormalizedQuery,
 	type ParsedQuery,
 	type PlanContext,
+	type Tenant,
+	allTenants,
 	normalizeQuery,
 	planLookup,
 	planQuery,
@@ -112,8 +114,12 @@ export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	datasets: DS
 	/** Databases by name; a dataset's `source` picks one, or the only one is used. */
 	sources: Record<string, AnalyticsSource>
-	/** The tenant every query is scoped to. Queries without one are refused. */
-	tenant: (ctx: Ctx) => string | number | null | undefined
+	/**
+	 * The tenant every query is scoped to. Queries without one (null, undefined, '') are
+	 * refused. Return `allTenants` to drop the tenant filter, only for callers allowed to see
+	 * every tenant's rows.
+	 */
+	tenant: (ctx: Ctx) => Tenant | null | undefined
 	/**
 	 * Whether `ctx` may query `dataset`. Everything is allowed when omitted. It decides what
 	 * `listDatasets(ctx)` and `querySchema({ ctx })` offer, and is checked again on every query.
@@ -195,6 +201,17 @@ export type AnalyticsResult<A, Q> =
 
 type ShapedResult = QueryResult<Row, Row>
 
+/** A parsed, authorized query with everything the hooks decide resolved. */
+type Prepared = {
+	dataset: AnyDataset
+	query: NormalizedQuery
+	tenant: Tenant
+	timezone: string
+	period: ResolvedPeriod
+	previous: ResolvedPeriod | null
+	now: Date
+}
+
 export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	options: AnalyticsOptions<DS, Ctx>
 ): Analytics<DS, Ctx> {
@@ -273,7 +290,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	}
 
 	/** Parse, authorize, and resolve everything that comes from hooks. */
-	const prepare = async (input: unknown, ctx: Ctx) => {
+	const prepare = async (input: unknown, ctx: Ctx): Promise<Prepared> => {
 		const parsed = querySchemaFor(undefined).safeParse(input)
 		if (!parsed.success) {
 			throw new AnalyticsError(
@@ -291,8 +308,8 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			)
 		}
 
-		const tenant = options.tenant(ctx)
-		if (tenant === null || tenant === undefined || tenant === '') {
+		const tenant: unknown = options.tenant(ctx)
+		if (!isTenant(tenant)) {
 			throw new AnalyticsError(
 				'missing_tenant',
 				'Refusing to query without a tenant'
@@ -469,6 +486,18 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	}
 }
 
+/**
+ * Fails closed: only a non-empty string, a finite number or `allTenants` scopes a query, even
+ * when a JavaScript caller's hook returns something its type does not allow.
+ */
+function isTenant(value: unknown): value is Tenant {
+	return (
+		value === allTenants ||
+		(typeof value === 'string' && value !== '') ||
+		(typeof value === 'number' && Number.isFinite(value))
+	)
+}
+
 /** The statement for a period's rows, and for its totals when the query groups. */
 function periodStatements(
 	dataset: AnyDataset,
@@ -562,7 +591,7 @@ function compileEverything(dataset: AnyDataset, dialect: Dialect): void {
 async function resolveOpenValues(
 	dataset: AnyDataset,
 	query: NormalizedQuery,
-	tenant: string | number,
+	tenant: Tenant,
 	now: Date,
 	run: (statement: SelectStatement) => Promise<readonly Row[]>,
 	dialect: Dialect

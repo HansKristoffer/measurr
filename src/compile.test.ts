@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+	allTenants,
 	type AnyDataset,
 	caseWhen,
 	type CompiledStatement,
@@ -114,6 +115,74 @@ describe('planner rules', () => {
 			analytics.explain(QUERIES.ungrouped, { tenantId: '' })
 		).rejects.toMatchObject({
 			code: 'missing_tenant'
+		})
+	})
+
+	describe('platform admins', () => {
+		type Viewer =
+			| { role: 'admin'; organizationId?: string }
+			| { role: 'member'; organizationId: string }
+		const sql: string[] = []
+		const scoped = createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text }) => {
+						sql.push(text)
+						return []
+					}
+				}
+			},
+			tenant: (viewer: Viewer) =>
+				viewer.role === 'admin'
+					? (viewer.organizationId ?? allTenants)
+					: viewer.organizationId,
+			now: () => NOW
+		})
+		const tenantFilter = '"orders"."tenantId" ='
+
+		test('an admin without an organization queries every tenant', async () => {
+			sql.length = 0
+			// The tag filter runs the label lookup first; it finds nothing and fails.
+			await expect(
+				scoped.query(
+					{
+						dataset: 'orders',
+						measures: ['orders'],
+						filters: [{ dimension: 'tag', op: 'in', values: ['Complaint'] }]
+					},
+					{ role: 'admin' }
+				)
+			).rejects.toMatchObject({ code: 'unknown_value' })
+			const statements = await scoped.explain(QUERIES.weeklyComputed, {
+				role: 'admin'
+			})
+
+			expect(sql).toHaveLength(2)
+			for (const text of [...sql, ...statements.map((s) => s.text)]) {
+				expect(text).not.toContain(tenantFilter)
+			}
+		})
+
+		test('an admin with an organization and a member are scoped to it', async () => {
+			for (const viewer of [
+				{ role: 'admin', organizationId: 'org-1' },
+				{ role: 'member', organizationId: 'org-1' }
+			] as const) {
+				const [statement] = await scoped.explain(QUERIES.ungrouped, viewer)
+				expect(statement?.text).toContain(tenantFilter)
+				expect(statement?.values).toContain('org-1')
+			}
+		})
+
+		test('a member without an organization is refused', async () => {
+			await expect(
+				scoped.explain(QUERIES.ungrouped, {
+					role: 'member',
+					organizationId: ''
+				})
+			).rejects.toMatchObject({ code: 'missing_tenant' })
 		})
 	})
 

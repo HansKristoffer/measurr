@@ -75,9 +75,18 @@ export function normalizeQuery(
 	}
 }
 
+/**
+ * What `tenant(ctx)` returns to query every tenant at once, for platform admins. It is a
+ * symbol, so no query input (JSON, a model's tool call) can ever carry it.
+ */
+export const allTenants: unique symbol = Symbol('measurr.allTenants')
+
+/** One tenant's id, or `allTenants`. */
+export type Tenant = string | number | typeof allTenants
+
 /** What the planner needs besides the query: values from the hooks and resolved labels. */
 export type PlanContext = {
-	tenant: string | number
+	tenant: Tenant
 	timezone: string
 	period: ResolvedPeriod
 	/** The moment the query runs. */
@@ -203,17 +212,20 @@ function dimensionNodes(
 /** Tenant, scope and period: the conditions every statement of a query carries. */
 function baseWhere(
 	dataset: AnyDataset,
-	tenant: string | number,
+	tenant: Tenant,
 	period: { time: string; start: Date; end: Date } | null
 ): ExprNode[] {
-	const where: ExprNode[] = [
-		{
-			kind: 'compare',
-			op: '=',
-			left: dataset.tenantColumn,
-			right: param(tenant)
-		}
-	]
+	const where: ExprNode[] =
+		tenant === allTenants
+			? []
+			: [
+					{
+						kind: 'compare',
+						op: '=',
+						left: dataset.tenantColumn,
+						right: param(tenant)
+					}
+				]
 	if (dataset.scope) where.push(dataset.scope)
 
 	if (period) {
@@ -408,7 +420,7 @@ function orderBy(
 export function planLookup(
 	dataset: AnyDataset,
 	dimensionKey: string,
-	tenant: string | number,
+	tenant: Tenant,
 	values: readonly string[] | null,
 	now: Date
 ): SelectStatement {

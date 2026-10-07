@@ -11,6 +11,7 @@ import { SQL } from 'bun'
 import {
 	AnalyticsError,
 	AnalyticsResultSchema,
+	allTenants,
 	createAnalytics
 } from './index.js'
 import { postgresDialect } from './dialects/postgres.js'
@@ -247,6 +248,28 @@ describe.skipIf(!url)('postgres integration', () => {
 
 		expect(byLabel.totals.orders).toBe(2)
 		expect(notTagged.totals.orders).toBe(2)
+	})
+
+	test('allTenants counts every tenant and resolves labels across them', async () => {
+		const everyTenant = createAnalytics({
+			datasets: [orders],
+			sources: { main: source },
+			tenant: () => allTenants,
+			now: () => NOW
+		})
+		const query = {
+			dataset: 'orders',
+			measures: ['orders'],
+			filters: [{ dimension: 'tag', op: 'in', values: ['complaint'] }]
+		} as const
+
+		expect((await analytics.query(query, tenantA)).totals.orders).toBe(2)
+		// B's "other" tag is also named Complaint.
+		expect((await everyTenant.query(query, {})).totals.orders).toBe(3)
+		expect(
+			(await everyTenant.query({ dataset: 'orders', measures: ['orders'] }, {}))
+				.totals.orders
+		).toBe(6)
 	})
 
 	test('an unknown value lists the valid ones', async () => {

@@ -1,5 +1,6 @@
 import { describe, expectTypeOf, test } from 'bun:test'
 import {
+	allTenants,
 	type AnalyticsQuery,
 	type AnalyticsResult,
 	type Ratio,
@@ -39,6 +40,25 @@ const order = table<Order>('orders')
 
 // These run only through the typechecker; the bodies are never called.
 const typeOnly = (_body: () => unknown) => undefined
+
+describe('tenant hook', () => {
+	test('only allTenants widens a query beyond one tenant', () => {
+		typeOnly(() => {
+			createAnalytics({
+				datasets: [orders],
+				sources: { main: source },
+				tenant: (ctx: { organizationId?: string }) =>
+					ctx.organizationId ?? allTenants
+			})
+			createAnalytics({
+				datasets: [orders],
+				sources: { main: source },
+				// @ts-expect-error any other symbol is not a tenant
+				tenant: () => Symbol('all')
+			})
+		})
+	})
+})
 
 describe('typed tables and expressions', () => {
 	test('columns are checked against the row type', () => {
