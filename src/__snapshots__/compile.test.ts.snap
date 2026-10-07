@@ -1,0 +1,88 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`postgres compiler ungrouped 1`] = `
+"SELECT count(*) AS "m_orders", sum("orders"."amount") AS "m_revenue", percentile_cont(0.5) WITHIN GROUP (ORDER BY ("orders"."amount")::double precision) AS "m_medianAmount"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."createdAt" >= $3) AND ("orders"."createdAt" < $4)
+-- values: ["tenant-1",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000"]"
+`;
+
+exports[`postgres compiler shareAndRatio 1`] = `
+"SELECT ((count(*) FILTER (WHERE ("orders"."status" = $1)))::double precision / NULLIF(count(*), 0)) AS "m_paidShare", ((count(*) FILTER (WHERE (EXISTS (SELECT 1 FROM "refunds" AS "refunds" WHERE ("refunds"."orderId" = "orders"."id")))))::double precision / NULLIF(count(*), 0)) AS "m_refundRate"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $2) AND ("orders"."isTest" = $3) AND ("orders"."createdAt" >= $4) AND ("orders"."createdAt" < $5)
+-- values: ["PAID","tenant-1",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000"]"
+`;
+
+exports[`postgres compiler byStatusAndRegion 1`] = `
+"SELECT "orders"."status" AS "g_status", "regions"."id" AS "g_region", "regions"."name" AS "g_region__label", count(*) AS "m_orders", count(DISTINCT "orders"."customerId") AS "m_customers"
+FROM "orders" AS "orders" LEFT JOIN "regions" AS "regions" ON ("regions"."id" = "orders"."regionId")
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."createdAt" >= $3) AND ("orders"."createdAt" < $4) AND (("orders"."status" NOT IN ($5)) OR ("orders"."status" IS NULL)) AND ("regions"."id" IS NOT NULL)
+GROUP BY 1, 2, 3
+ORDER BY "m_customers" DESC, "g_status" ASC, "g_region" ASC
+LIMIT 11
+-- values: ["tenant-1",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","OPEN"]
+
+SELECT count(*) AS "m_orders", count(DISTINCT "orders"."customerId") AS "m_customers"
+FROM "orders" AS "orders" LEFT JOIN "regions" AS "regions" ON ("regions"."id" = "orders"."regionId")
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."createdAt" >= $3) AND ("orders"."createdAt" < $4) AND (("orders"."status" NOT IN ($5)) OR ("orders"."status" IS NULL)) AND ("regions"."id" IS NOT NULL)
+-- values: ["tenant-1",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","OPEN"]"
+`;
+
+exports[`postgres compiler byTagFilteredByTag 1`] = `
+"SELECT "tags"."id" AS "g_tag", "tags"."name" AS "g_tag__label", count(*) AS "m_orders"
+FROM "orders" AS "orders" LEFT JOIN "order_tags" AS "order_tags" ON ("order_tags"."orderId" = "orders"."id") LEFT JOIN "tags" AS "tags" ON ("tags"."id" = "order_tags"."tagId")
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."createdAt" >= $3) AND ("orders"."createdAt" < $4) AND (EXISTS (SELECT 1 FROM "order_tags" AS "order_tags" LEFT JOIN "tags" AS "tags" ON ("tags"."id" = "order_tags"."tagId") WHERE (("order_tags"."orderId" = "orders"."id") AND ("tags"."id" IN ($5)))))
+GROUP BY 1, 2
+ORDER BY "m_orders" DESC, "g_tag" ASC
+LIMIT 21
+-- values: ["tenant-1",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","tag-complaint"]
+
+SELECT count(*) AS "m_orders"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."createdAt" >= $3) AND ("orders"."createdAt" < $4) AND (EXISTS (SELECT 1 FROM "order_tags" AS "order_tags" LEFT JOIN "tags" AS "tags" ON ("tags"."id" = "order_tags"."tagId") WHERE (("order_tags"."orderId" = "orders"."id") AND ("tags"."id" IN ($5)))))
+-- values: ["tenant-1",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","tag-complaint"]"
+`;
+
+exports[`postgres compiler weeklyComputed 1`] = `
+"SELECT to_char(date_trunc('week', (("orders"."createdAt") AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Copenhagen')), 'YYYY-MM-DD') AS "g_week", (CASE WHEN ("orders"."amount" >= $1) THEN $2 WHEN ("orders"."amount" >= $3) THEN $4 ELSE $5 END) AS "g_size", count(*) AS "m_orders", avg("orders"."amount") AS "m_averageAmount"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $6) AND ("orders"."isTest" = $7) AND ("orders"."createdAt" >= $8) AND ("orders"."createdAt" < $9) AND (("orders"."rating" >= $10) AND ("orders"."rating" <= $11))
+GROUP BY 1, 2
+ORDER BY "g_week" ASC, "g_size" ASC
+LIMIT 21
+-- values: [1000,"large",100,"medium","small","tenant-1",false,"2025-12-31 23:00:00.000","2026-10-07 22:00:00.000",1,3]
+
+SELECT count(*) AS "m_orders", avg("orders"."amount") AS "m_averageAmount"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."createdAt" >= $3) AND ("orders"."createdAt" < $4) AND (("orders"."rating" >= $5) AND ("orders"."rating" <= $6))
+-- values: ["tenant-1",false,"2025-12-31 23:00:00.000","2026-10-07 22:00:00.000",1,3]
+
+SELECT to_char(date_trunc('week', (("orders"."createdAt") AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Copenhagen')), 'YYYY-MM-DD') AS "g_week", (CASE WHEN ("orders"."amount" >= $1) THEN $2 WHEN ("orders"."amount" >= $3) THEN $4 ELSE $5 END) AS "g_size", count(*) AS "m_orders", avg("orders"."amount") AS "m_averageAmount"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $6) AND ("orders"."isTest" = $7) AND ("orders"."createdAt" >= $8) AND ("orders"."createdAt" < $9) AND (("orders"."rating" >= $10) AND ("orders"."rating" <= $11))
+GROUP BY 1, 2
+ORDER BY "g_week" ASC, "g_size" ASC
+LIMIT 21
+-- values: [1000,"large",100,"medium","small","tenant-1",false,"2025-03-26 23:00:00.000","2025-12-31 23:00:00.000",1,3]
+
+SELECT count(*) AS "m_orders", avg("orders"."amount") AS "m_averageAmount"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."createdAt" >= $3) AND ("orders"."createdAt" < $4) AND (("orders"."rating" >= $5) AND ("orders"."rating" <= $6))
+-- values: ["tenant-1",false,"2025-03-26 23:00:00.000","2025-12-31 23:00:00.000",1,3]"
+`;
+
+exports[`postgres compiler byWeekdayAndHour 1`] = `
+"SELECT CAST(extract(isodow FROM (("orders"."createdAt") AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Copenhagen')) AS integer) AS "g_weekday", CAST(extract(hour FROM (("orders"."createdAt") AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Copenhagen')) AS integer) AS "g_hour", count(*) AS "m_orders"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."shippedAt" >= $3) AND ("orders"."shippedAt" < $4)
+GROUP BY 1, 2
+ORDER BY "g_weekday" ASC, "g_hour" ASC
+LIMIT 21
+-- values: ["tenant-1",false,"2026-08-31 22:00:00.000","2026-09-30 22:00:00.000"]
+
+SELECT count(*) AS "m_orders"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."shippedAt" >= $3) AND ("orders"."shippedAt" < $4)
+-- values: ["tenant-1",false,"2026-08-31 22:00:00.000","2026-09-30 22:00:00.000"]"
+`;

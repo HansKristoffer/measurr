@@ -1,0 +1,84 @@
+{
+	"name": "measurr",
+	"version": "0.0.0",
+	"description": "A small typed semantic layer: datasets of measures and dimensions compiled to one SQL statement per dialect.",
+	"type": "module",
+	"module": "./dist/index.js",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/HansKristoffer/measurr.git"
+	},
+	"homepage": "https://github.com/HansKristoffer/measurr#readme",
+	"bugs": {
+		"url": "https://github.com/HansKristoffer/measurr/issues"
+	},
+	"author": "Kristoffer Hansen",
+	"keywords": [
+		"typescript",
+		"semantic-layer",
+		"analytics",
+		"sql",
+		"postgres",
+		"zod",
+		"llm-tools"
+	],
+	"files": [
+		"src/**/*.ts",
+		"dist",
+		"!src/**/*.test.ts",
+		"!src/fixtures"
+	],
+	"sideEffects": false,
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"bun": "./src/index.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./postgres": {
+			"types": "./dist/dialects/postgres.d.ts",
+			"bun": "./src/dialects/postgres.ts",
+			"import": "./dist/dialects/postgres.js",
+			"default": "./dist/dialects/postgres.js"
+		},
+		"./testing": {
+			"types": "./dist/testing.d.ts",
+			"bun": "./src/testing.ts",
+			"import": "./dist/testing.js",
+			"default": "./dist/testing.js"
+		}
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun run build:js && bun run build:types",
+		"build:js": "bun build ./src/index.ts ./src/dialects/postgres.ts ./src/testing.ts --root ./src --outdir ./dist --target node --packages external --splitting",
+		"build:types": "tsgo -p tsconfig.build.json",
+		"prepublishOnly": "bun run build",
+		"test": "bun test",
+		"lint": "bun run typecheck && biome check",
+		"lint:write": "bun run typecheck && biome check --write",
+		"typecheck": "tsgo --noEmit",
+		"prepare": "husky",
+		"verify:package": "node scripts/verify-package.mjs"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.15",
+		"@types/bun": "latest",
+		"@typescript/native-preview": "^7.0.0-dev.20260306.1",
+		"husky": "^9.1.7",
+		"zod": "^4.3.6"
+	},
+	"peerDependencies": {
+		"typescript": ">=6.0.0",
+		"zod": "^4.0.0"
+	},
+	"peerDependenciesMeta": {
+		"typescript": {
+			"optional": true
+		}
+	},
+	"packageManager": "bun@1.4.2"
+}

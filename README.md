@@ -1,0 +1,340 @@
+# measurr
+
+A small, typed semantic layer. You declare **datasets** (one fact table each) with
+**measures** and **dimensions**; callers (people, charts, an LLM tool) send a small JSON
+query; the engine compiles it to SQL for your database, runs it through your driver and
+returns shaped, typed rows.
+
+- No SQL text in definitions: datasets are built from typed expression builders, so a
+  renamed column, `avg` over a string or `between` on an enum fails typecheck.
+- Database-neutral definitions: dialects plug in through the `Dialect` interface, and Postgres
+  ships today (`measurr/postgres`).
+- Tenant-scoped by construction: the engine adds the tenant filter to every statement and
+  refuses to run without a tenant.
+- The query schema is generated with Zod, so it doubles as an LLM tool schema
+  (`z.toJSONSchema`) and as the request validator. It can be built per caller, offering only
+  the datasets they may query.
+- No driver or ORM dependency. `zod` is a peer dependency.
+
+## Quick start
+
+```ts
+import {
+	caseWhen, createAnalytics, defineDataset, dimension, eq, exists, gte, measure, table
+} from 'measurr'
+import { postgresDialect } from 'measurr/postgres'
+
+// Row types are plain TypeScript types (Prisma models work as they are).
+const order = table<Order>('orders')
+
+// A join declares its ON clause once. Any expression that reads `region` brings the join
+// with it; the planner adds it only when a query uses such an expression.
+const region = order.leftJoin(table<Region>('regions'), (r) =>
+	eq(r.col('id'), order.col('regionId'))
+)
+
+// A many-to-many link is a standalone table plus its link condition.
+const orderTag = table<OrderTag>('order_tags')
+const tag = orderTag.leftJoin(table<Tag>('tags'), (t) => eq(t.col('id'), orderTag.col('tagId')))
+const refund = table<Refund>('refunds')
+
+export const orders = defineDataset({
+	key: 'orders',
+	label: 'Orders',
+	description: 'One row per order. Test orders are excluded.',
+	from: order,
+	tenantColumn: order.col('tenantId'),
+	scope: eq(order.col('isTest'), false),
+	time: { created: { column: order.col('createdAt'), label: 'Created' } },
+	measures: {
+		orders: measure.count({ label: 'Orders' }),
+		revenue: measure.sum(order.col('amount'), { label: 'Revenue' }),
+		refunded: measure.countWhere(exists(refund, eq(refund.col('orderId'), order.col('id'))), {
+			label: 'Refunded orders'
+		}),
+		paidShare: measure.share({ label: 'Paid', numerator: eq(order.col('status'), 'PAID') }),
+		refundRate: measure.ratio('refunded', 'orders', { label: 'Refund rate' })
+	},
+	dimensions: {
+		status: dimension.enum(order.col('status'), OrderStatus, {
+			label: 'Status',
+			labels: { OPEN: 'Open', PAID: 'Paid', REFUNDED: 'Refunded' }
+		}),
+		region: dimension.relation({
+			label: 'Region', key: region.col('id'), name: region.col('name'), empty: 'No region'
+		}),
+		tag: dimension.manyToMany({
+			label: 'Tag',
+			through: {
+				table: orderTag,
+				on: eq(orderTag.col('orderId'), order.col('id')),
+				key: tag.col('id'),
+				name: tag.col('name')
+			},
+			note: 'An order with several tags counts once per tag.'
+		}),
+		size: dimension.computed({
+			label: 'Size',
+			expr: caseWhen([[gte(order.col('amount'), 1000), 'large']], 'small'),
+			values: { large: 'Large', small: 'Small' }
+		}),
+		week: dimension.timeBucket('created', 'week'),
+		hour: dimension.timePart('created', 'hour')
+	}
+})
+
+export const analytics = createAnalytics({
+	datasets: [orders],
+	sources: {
+		main: {
+			dialect: postgresDialect({ timestamps: 'utc' }),
+			// Run read-only, with a statement timeout, through any driver.
+			execute: ({ text, values }) => db.unsafe(text, [...values])
+		}
+	},
+	tenant: (ctx: Ctx) => ctx.organizationId,
+	authorize: (dataset, ctx) => ctx.can(`analytics:${dataset.key}`),
+	timezone: (ctx) => ctx.timezone,
+	onQuery: (event, ctx) => metrics.record(event.dataset, event.durationMs, event.outcome)
+})
+
+const result = await analytics.query(
+	{
+		dataset: 'orders',
+		measures: ['orders', 'paidShare'],
+		groupBy: ['status'],
+		filters: [{ dimension: 'tag', op: 'in', values: ['Complaint'] }],
+		period: { last: { days: 30 } },
+		compareToPrevious: true
+	},
+	ctx
+)
+result.rows[0]?.status.key // 'OPEN' | 'PAID' | 'REFUNDED'
+result.rows[0]?.paidShare // Ratio | null
+```
+
+## Callers and tools
+
+`authorize` is the one access rule. Everything that offers datasets goes through it:
+
+- `analytics.listDatasets(ctx)` resolves to the catalog entries (measures, dimensions, closed
+  values) of the datasets `ctx` may query.
+- `analytics.querySchema({ ctx })` resolves to the input schema for those datasets, for a tool
+  built per caller. It rejects with `AnalyticsError('forbidden')` when nothing is allowed.
+  `analytics.querySchema({ datasets })` is the synchronous form for a list you already have
+  (typed for those datasets only), and `querySchema()` covers every dataset. Schemas are built once per set of datasets, so
+  `querySchema({ ctx })` returns the same object as `querySchema({ datasets })` for the same
+  allowed set: cache a tool built from it by its dataset keys.
+- `analytics.query` checks `authorize` again on every call, so a schema offered too widely
+  still cannot leak a dataset.
+
+`AnalyticsResultSchema` is any dataset's result without its keys: rows of `{ key, label }`
+per grouped dimension and a number or null per measure, with totals, `previous?`, `notes` and
+`truncated`. `analytics.resultSchema(key)` is the same envelope with the dataset's fields, so a
+result that passes one passes the other. Use it for a tool's output contract.
+
+`analyticsToolGuidance` is a few markdown bullets for a model's instructions: use the tool for
+every how-many, how-much, per-period or split-by question and never count from lists; state the
+period and filters; compare with the previous period when the change is the point; say when
+grouped rows overlap; ask only when the period is genuinely ambiguous. It does not name the
+tool, so add a line that does:
+
+```ts
+const instructions = `# Numbers
+The analytics tool is analytics_query.
+${analyticsToolGuidance}`
+```
+
+`onQuery(event, ctx)` hears every `query` once it succeeds or fails:
+`{ dataset, durationMs, rows, outcome: 'success' | 'error', error? }`. `dataset` is null when
+the input named no known dataset, so free text from a model never becomes a metric label.
+What the hook throws or rejects with is swallowed; it cannot fail a query.
+
+## The model
+
+| Concept | What it is |
+| --- | --- |
+| Dataset | One fact table: tenant column, optional scope, time fields, measures, dimensions, source. |
+| Measure | `count`, `countWhere`, `countDistinct`, `sum`, `avg`, `median`, `share` (one condition over another) or `ratio` (one measure over another, after aggregation). |
+| Dimension | `enum`, `computed` (closed value sets), `relation` (to-one), `manyToMany`, `number`, `timeBucket` (day, ISO week, month), `timePart` (ISO weekday, hour). |
+| Query | `dataset`, 1-4 `measures`, 0-2 `groupBy`, `filters`, `period`, `time`, `compareToPrevious`, `sort` (by an asked measure or grouped dimension), `limit` (1-100, default 20). |
+| Result | `{ period, rows, totals, previous?, notes, truncated }`. |
+
+**Operators per dimension kind.** Closed and open dimensions take `in`, `notIn`, `isEmpty`
+and `isNotEmpty`; numeric and time dimensions take `between`, `isEmpty` and `isNotEmpty`. The
+query types and the generated schema both enforce this. `notIn` keeps rows without a value,
+unlike SQL's `NOT IN`.
+
+**Open values are keys or labels.** Filters on `relation` and `manyToMany` dimensions accept
+keys or names (case-insensitive); the engine resolves them before planning. An unknown value
+fails with `AnalyticsError('unknown_value')` listing the valid values, so a model can retry
+once.
+
+**Errors carry typed details.** `isAnalyticsError(error, code?)` narrows by code:
+`unknown_value` details are `{ dimension, unknown, valid }` and `invalid_query` details are the
+schema's issues; the other codes have none.
+
+```ts
+try {
+	return await analytics.query(input, ctx)
+} catch (error) {
+	if (isAnalyticsError(error, 'unknown_value')) return { retryWith: error.details.valid }
+	throw error
+}
+```
+
+**Periods** are whole local days in the tenant's timezone (`timezone` hook, UTC by default):
+`{ last: { days } }`, `{ from, to }` (inclusive ISO dates) or `{ preset }` (`today`,
+`yesterday`, `thisWeek`, `lastWeek`, `thisMonth`, `lastMonth`, `thisYear`). At most two years.
+The previous period has the same length and ends the day before. Time buckets use the same
+timezone. `time` picks the time field the period applies to; a time dimension names its own.
+
+**Totals are a separate, ungrouped statement**, so a many-to-many grouping (an order with
+two tags appears in two rows) never inflates them. Filters on many-to-many dimensions compile
+to `EXISTS`, so they never multiply rows either.
+
+**Result types are honest.** `count` measures are `number`; `sum`, `avg` and `median` are
+`number | null`; `share` and `ratio` are a branded `Ratio | null` (0-1). A row has a field only
+for the dimensions it was grouped by. Relation, many-to-many, number and time keys may be
+null (no related row, no value). Enum and computed keys are null only when their expression
+can be: a nullable enum column, or a `caseWhen` without `otherwise`. Name that group with
+`empty` (default "None"), or `coalesce` the column to a value.
+
+## Types that do the work
+
+- `table<Row>(name).col(key)` only accepts keys of `Row` whose type maps to SQL
+  (`number`/`bigint`/Decimal → number, `string` → string, `boolean`, `Date` → timestamp). JSON
+  and relation fields are excluded.
+- Operands must match: `eq(numberColumn, 'x')` fails. A column keeps its value type, so
+  `eq(order.col('status'), 'PAD')` and `inList(order.col('status'), ['CLOSED'])` fail on an
+  enum column (`toText` compares with anything). `.add/.sub/.mul/.div` exist only on number
+  expressions; `div` is always floating-point and null when dividing by zero.
+- `measure.avg/sum/median` take numbers, `measure.share` takes booleans, time fields take
+  timestamps.
+- Expressions know whether they can be null. A nullable or optional field gives a nullable
+  column; `caseWhen` without `otherwise` is nullable; `coalesce` with a plain fallback is not.
+  Plain operands are never null, so `eq(column, null)` fails: use `isNull`.
+- `dimension.enum` needs a label for every enum value, and fails when the column can hold a
+  value the enum does not list.
+- `dimension.computed` fails when `values` misses a value its `caseWhen` can produce.
+- `dimension.relation` takes its key type from the key column, so a branded id column types
+  the key in filters and rows; `relation<number>` over a string column fails.
+- `groupOnly` dimensions cannot be named in `filters`, and `filterOnly` ones cannot be named
+  in `groupBy` or `sort`.
+- `measure.ratio('a', 'b')` must name measures of the same dataset; time dimensions must name
+  declared time fields.
+- `AnalyticsQuery<typeof analytics>` is the query union; `analytics.query` returns rows typed
+  by the query's `measures` and `groupBy`.
+
+What the types cannot see, `defineDataset` checks when the module loads: every column is
+reachable from the dataset's table (joins, `exists` subqueries, the many-to-many link), ratio
+measures have no cycles, and a computed dimension's `values` cover every value its expression
+can produce (repeating the type check for expressions typed only as `string`). `createAnalytics` then checks every dataset's source exists and compiles every
+measure, grouping and filter once, so a definition the dialect cannot render fails at startup.
+
+## Sources and dialects
+
+A source is `{ dialect, execute }`. `execute` receives `{ text, values }` (positional values
+for the `$n` placeholders) and returns rows as plain objects. Read-only transactions, statement timeouts and row
+caps belong in `execute`. A dataset names its source with `source`; with one source it is the
+default.
+
+Rows can come back as the driver returns them. The dialect's `decodeNumber` accepts numbers,
+numeric strings, bigints and decimal objects with a `toNumber()` method (Prisma's `Decimal`,
+decimal.js); anything else is null. Relation keys that are numbers decode the same way.
+
+For example, Prisma in a read-only transaction that Postgres stops after five seconds:
+
+```ts
+const STATEMENT_TIMEOUT_MS = 5_000
+
+const main: AnalyticsSource = {
+	dialect: postgresDialect({ timestamps: 'utc' }),
+	execute: ({ text, values }) =>
+		prisma.$transaction(
+			async (tx) => {
+				await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+				await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`)
+				return tx.$queryRawUnsafe<Record<string, unknown>[]>(text, ...values)
+			},
+			{ timeout: STATEMENT_TIMEOUT_MS + 1_000 }
+		)
+}
+```
+
+**`measurr/postgres`** `postgresDialect({ timestamps })`: `$n` parameters (untyped,
+so Postgres infers them from the column, which keeps enum columns working), double-quoted
+identifiers, `FILTER (WHERE ...)`, `count(DISTINCT ...)`, `percentile_cont`, correlated
+`EXISTS`, buckets with `AT TIME ZONE`, GROUP BY by position. Set `timestamps: 'utc'` for
+`timestamp without time zone` columns that hold UTC (Prisma's `DateTime`); the default
+`'timestamptz'` is for `timestamp with time zone`.
+
+## Testing your datasets
+
+`measurr/testing` runs the same checks for every dataset against a seeded database:
+
+```ts
+import { assertDatasetContract } from 'measurr/testing'
+
+await assertDatasetContract({ dataset: orders, source, tenant: seededTenantId })
+```
+
+It checks that every measure runs and returns a number or null, every grouping runs and its
+groups add up to the total (except many-to-many), `isEmpty` plus `isNotEmpty` equals the total,
+open dimensions filter by label to their group's count, closed dimensions filter by value, an
+empty tenant sees nothing (tenant isolation), and day buckets in a far-from-UTC timezone
+(default `Pacific/Auckland`) agree with single-day periods.
+
+## Extending
+
+- **A measure or dimension** is one entry in a dataset. Dimensions are groupable and
+  filterable unless `groupOnly` or `filterOnly` says otherwise. The contract kit covers it
+  without a new test.
+- **A dataset** is one `defineDataset` call added to `createAnalytics({ datasets })`.
+- **A computed value** is written with the expression builders (`caseWhen`, `exists`,
+  `coalesce`, `toText`, `minutesAgo`, comparisons, `and`/`or`/`not`), never SQL. When a
+  definition needs something they cannot say, add a builder and render it in every dialect.
+- **A dialect** implements `Dialect` (`name`, `compile`, `decodeNumber`). Most dialects only
+  provide a `SqlRenderer` (quoting, parameters, aggregates, division, time buckets and parts)
+  and call `renderStatement`. It is done when the snapshot tests and the
+  contract kit pass on it.
+
+## Stable API
+
+Kept stable for publishing: `createAnalytics` and its options, `analytics.query`,
+`explain`, `querySchema`, `resultSchema`, `listDatasets`; `AnalyticsResultSchema`,
+`analyticsToolGuidance`, `AnalyticsQueryEvent`; `defineDataset`, `measure.*`,
+`dimension.*`, `table` / `Table`, the expression builders; the `Dialect`, `SqlRenderer` and
+`AnalyticsSource` contracts; `postgresDialect`, `checkDatasetContract` /
+`assertDatasetContract`; and the types
+`AnalyticsQuery`, `AnalyticsResult`, `Ratio`, `AnalyticsError` codes and their details
+(`isAnalyticsError`). `ExprNode` and `SelectStatement` are
+exported for dialect authors and may grow new node kinds.
+
+## Install
+
+```sh
+npm install measurr zod
+```
+
+`zod` 4 is a peer dependency. The types need TypeScript 6 or newer.
+
+## Development
+
+```sh
+bun install
+bun run lint   # types and Biome
+bun test
+# With a throwaway Postgres (the integration test creates and drops its own tables):
+ANALYTICS_TEST_DATABASE_URL=postgres://... bun test
+bun run build && bun run verify:package
+```
+
+The integration test reads `ANALYTICS_TEST_DATABASE_URL`, not `DATABASE_URL`, because Bun
+loads `.env` files and that name may point at a real database. CI runs it against Postgres 17.
+
+Releases are automated with Release Please; see [docs/releasing.md](docs/releasing.md).
+
+## License
+
+MIT
