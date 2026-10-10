@@ -383,24 +383,22 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			return { rows, totals, truncated }
 		}
 
+		const range = ({ from, to }: ResolvedPeriod) => ({ from, to, timezone })
 		const [current, before] = await Promise.all([
 			runPeriod(period),
-			previous ? runPeriod(previous) : null
+			previous &&
+				runPeriod(previous).then(({ rows, totals }) => ({
+					period: range(previous),
+					rows,
+					totals
+				}))
 		])
-		const range = ({ from, to }: ResolvedPeriod) => ({ from, to, timezone })
 
 		return {
 			period: period ? range(period) : { all: true, timezone },
 			rows: current.rows,
 			totals: current.totals,
-			...(previous &&
-				before && {
-					previous: {
-						period: range(previous),
-						rows: before.rows,
-						totals: before.totals
-					}
-				}),
+			...(before && { previous: before }),
 			notes: resultNotes(dataset, query),
 			truncated: current.truncated
 		}

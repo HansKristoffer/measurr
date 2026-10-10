@@ -217,14 +217,15 @@ function baseWhere(
 	const where: ExprNode[] = []
 	if (tenant !== allTenants) {
 		const ids = typeof tenant === 'object' ? [...new Set(tenant)] : [tenant]
+		const [only] = ids
 		// One id compiles exactly like the scalar; an empty list renders as a false condition.
 		where.push(
-			ids.length === 1 && ids[0] !== undefined
+			ids.length === 1 && only !== undefined
 				? {
 						kind: 'compare',
 						op: '=',
 						left: dataset.tenantColumn,
-						right: param(ids[0])
+						right: param(only)
 					}
 				: {
 						kind: 'in',

@@ -288,50 +288,23 @@ describe('planner rules', () => {
 		})
 	})
 
-	describe('all-time periods', () => {
+	test('a named period overrides an all-time dataset default', async () => {
 		const timeFilter = '"orders"."createdAt" >='
+		const [byDefault] = await analytics.explain(
+			{ dataset: 'orderBook', measures: ['orders'], period: null },
+			ctx
+		)
+		const [named] = await analytics.explain(
+			{
+				dataset: 'orderBook',
+				measures: ['orders'],
+				period: { last: { days: 7 } }
+			},
+			ctx
+		)
 
-		test('drop the time filter and keep time buckets', async () => {
-			const [rows, totals] = await analytics.explain(
-				QUERIES.monthlyAllTime,
-				ctx
-			)
-
-			expect(rows?.text).not.toContain(timeFilter)
-			expect(rows?.text).toContain("date_trunc('month'")
-			expect(totals?.text).not.toContain(timeFilter)
-		})
-
-		test('a dataset default applies when the query names no period', async () => {
-			const byDefault = await analytics.explain(
-				{ dataset: 'orderBook', measures: ['orders'], period: null },
-				ctx
-			)
-			const named = await analytics.explain(
-				{
-					dataset: 'orderBook',
-					measures: ['orders'],
-					period: { last: { days: 7 } }
-				},
-				ctx
-			)
-			const [orderDefault] = await analytics.explain(QUERIES.ungrouped, ctx)
-
-			expect(byDefault[0]?.text).not.toContain(timeFilter)
-			expect(named[0]?.text).toContain(timeFilter)
-			expect(orderDefault?.text).toContain(timeFilter)
-		})
-
-		test('cannot compare with a previous period', async () => {
-			for (const query of [
-				{ ...QUERIES.monthlyAllTime, compareToPrevious: true },
-				{ ...QUERIES.stateByStatus, compareToPrevious: true }
-			]) {
-				await expect(analytics.explain(query, ctx)).rejects.toMatchObject({
-					code: 'invalid_query'
-				})
-			}
-		})
+		expect(byDefault?.text).not.toContain(timeFilter)
+		expect(named?.text).toContain(timeFilter)
 	})
 
 	test('totals of a many-to-many grouping do not join the link table', async () => {

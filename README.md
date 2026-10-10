@@ -157,14 +157,15 @@ What the hook throws or rejects with is swallowed; it cannot fail a query.
 `tenant(ctx)` decides the scope of every statement, including the lookups that resolve filter
 labels. It returns a tenant id (`TenantId`, a non-empty string or a finite number), a readonly
 list of them, or `allTenants` to drop the tenant filter for a caller allowed to see every
-tenant. Anything else (null, undefined, `''`, a list holding one of those or `allTenants`,
-any other value) is refused with `AnalyticsError('missing_tenant')`, so a missing
+tenant. Anything else is refused with `AnalyticsError('missing_tenant')`: null, undefined,
+`''`, a list containing one of those or `allTenants`, or any other value. A missing
 organization never widens a query.
 
 A list compiles to `tenantColumn IN (...)` with one parameter per id; a one-element list is
 the same statement as its id. An empty list is a scope that matches no rows: a reseller with
-no connected organizations sees zeros, never everything. Use it for callers scoped to a set,
-such as an organization-group admin, a reseller, or either narrowed to a region:
+no connected organizations sees zeros, never everything. Lists are for callers scoped to a set
+of organizations, such as an organization-group admin, a reseller, or either narrowed to a
+region:
 
 ```ts
 tenant: (ctx: Ctx) => ctx.visibleOrganizationIds // readonly OrganizationId[]
@@ -237,10 +238,11 @@ timezone. `time` picks the time field the period applies to; a time dimension na
 `{ all: true }` drops the time filter: every row counts, and time buckets and parts still group
 by the time field. It has no previous period, so `compareToPrevious` with it is an
 `invalid_query`. The result's `period` is then `{ all: true, timezone }` instead of
-`{ from, to, timezone }`; `previous.period` is always a range. The type follows the query: a
-query that names a range, or names none on a dataset whose default is a range, has
-`result.period.from`; a query typed only as `AnalyticsQuery` (parsed from the schema) gets
-`ResultPeriod`, the union, to narrow with `'all' in result.period`.
+`{ from, to, timezone }`; `previous.period` is always a range. The type follows the query. A
+query that names a range, or names no period on a dataset whose default is a range, gets
+`{ from, to, timezone }`, so `result.period.from` needs no narrowing. A query typed only as
+`AnalyticsQuery` (parsed from the schema) gets the `ResultPeriod` union; narrow it with
+`'all' in result.period`.
 
 A query that names no period (or sends null) gets the dataset's `defaultPeriod`, the last 30
 days unless the dataset says otherwise. A dataset that describes current state (units,
@@ -341,8 +343,8 @@ await assertDatasetContract({ dataset: orders, source, tenant: seededTenantId })
 It checks that every measure runs and returns a number or null, every grouping runs and its
 groups add up to the total (except many-to-many), `isEmpty` plus `isNotEmpty` equals the total,
 open dimensions filter by label to their group's count, closed dimensions filter by value, an
-empty tenant and an empty tenant list see nothing (tenant isolation), and day buckets in a far-from-UTC timezone
-(default `Pacific/Auckland`) agree with single-day periods.
+empty tenant and an empty tenant list see nothing (tenant isolation), and day buckets in a
+far-from-UTC timezone (default `Pacific/Auckland`) agree with single-day periods.
 
 ## Extending
 
@@ -362,12 +364,11 @@ empty tenant and an empty tenant list see nothing (tenant isolation), and day bu
 
 Kept stable for publishing: `createAnalytics` and its options, `allTenants`, `analytics.query`,
 `explain`, `querySchema`, `resultSchema`, `listDatasets`; `AnalyticsResultSchema`,
-`analyticsToolGuidance`, `AnalyticsQueryEvent`; `defineDataset` (with `defaultPeriod`), `measure.*`,
-`dimension.*`, `table` / `Table`, the expression builders; the `Dialect`, `SqlRenderer` and
-`AnalyticsSource` contracts; `postgresDialect`, `checkDatasetContract` /
-`assertDatasetContract`; and the types
-`AnalyticsQuery`, `AnalyticsResult`, `ResultPeriod`, `PeriodInput`, `Tenant`, `TenantId`, `Ratio`,
-`AnalyticsError` codes and their details
+`analyticsToolGuidance`, `AnalyticsQueryEvent`; `defineDataset` (with `defaultPeriod`),
+`measure.*`, `dimension.*`, `table` / `Table`, the expression builders; the `Dialect`,
+`SqlRenderer` and `AnalyticsSource` contracts; `postgresDialect`, `checkDatasetContract` /
+`assertDatasetContract`; and the types `AnalyticsQuery`, `AnalyticsResult`, `ResultPeriod`,
+`PeriodInput`, `Tenant`, `TenantId`, `Ratio`, `AnalyticsError` codes and their details
 (`isAnalyticsError`). `ExprNode` and `SelectStatement` are
 exported for dialect authors and may grow new node kinds.
 

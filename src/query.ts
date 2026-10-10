@@ -114,20 +114,13 @@ export type ResultPeriod =
 	| { from: string; to: string; timezone: string }
 	| { all: true; timezone: string }
 
-/** The period a result covers: the one `Q` names, or the dataset default `Default`. */
-type ResultPeriodOf<Default, Q> = PeriodShape<
-	| NonNullable<GivenPeriod<Q>>
-	| (null extends GivenPeriod<Q>
-			? Default
-			: undefined extends GivenPeriod<Q>
-				? Default
-				: never)
->
-type GivenPeriod<Q> = Q extends unknown
+/** The period query `Q` names; null or none means the dataset's `Default`. */
+type QueryPeriod<Q, Default> = Q extends unknown
 	? 'period' extends keyof Q
-		? Q['period' & keyof Q]
-		: undefined
+		? OrDefault<Q['period' & keyof Q], Default>
+		: Default
 	: never
+type OrDefault<P, Default> = P extends null | undefined ? Default : P
 type PeriodShape<P> = P extends { all: true }
 	? Extract<ResultPeriod, { all: true }>
 	: Exclude<ResultPeriod, { all: true }>
@@ -157,7 +150,7 @@ export type ResultOf<DS, Q> =
 			? QueryResult<
 					ResultRow<M, Dm, Mk, GroupKeys<Q>>,
 					ResultTotals<M, Mk>,
-					ResultPeriodOf<P, Q>
+					PeriodShape<QueryPeriod<Q, P>>
 				>
 			: never
 		: never
@@ -371,6 +364,7 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 					message: `Sort by one of the asked measures or grouped dimensions: ${returned.join(', ')}`
 				})
 			}
+
 			const period = query.period ?? dataset.defaultPeriod
 			if (query.compareToPrevious && 'all' in period) {
 				context.addIssue({

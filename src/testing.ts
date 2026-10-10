@@ -206,7 +206,7 @@ export async function checkDatasetContract(
 	}
 
 	// An empty tenant list is a scope that matches nothing, never a missing filter.
-	for (const [name, other] of [
+	for (const [name, tenant] of [
 		['an empty tenant', emptyTenant],
 		['an empty tenant list', []]
 	] as const) {
@@ -215,7 +215,7 @@ export async function checkDatasetContract(
 			const leaked: [string, number | null][] = []
 			for (let start = 0; start < measures.length; start += MAX_MEASURES) {
 				const batch = measures.slice(start, start + MAX_MEASURES)
-				const result = await run({ measures: batch }, other)
+				const result = await run({ measures: batch }, tenant)
 				leaked.push(
 					...Object.entries(result.totals).filter(
 						([, value]) => value !== 0 && value !== null
@@ -228,7 +228,7 @@ export async function checkDatasetContract(
 
 			for (const [key, entry] of dimensions) {
 				if (!entry.groupable) continue
-				const grouped = await run({ measures: [COUNT], groupBy: [key] }, other)
+				const grouped = await run({ measures: [COUNT], groupBy: [key] }, tenant)
 				if (grouped.rows.length > 0)
 					return `${name} sees ${grouped.rows.length} ${key} groups`
 			}
