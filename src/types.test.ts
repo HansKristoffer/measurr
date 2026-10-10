@@ -1,5 +1,6 @@
 import { describe, expectTypeOf, test } from 'bun:test'
 import {
+	type AccessKey,
 	allTenants,
 	type AnalyticsQuery,
 	type AnalyticsResult,
@@ -99,9 +100,20 @@ describe('field access', () => {
 		tenant: () => 't',
 		authorizeField: (dataset, key, access, ctx: { roles: string[] }) => {
 			expectTypeOf(dataset.key).toEqualTypeOf<'orders' | 'sales'>()
-			expectTypeOf(key).toEqualTypeOf<string>()
+			expectTypeOf(access).toEqualTypeOf<'staff'>()
+			// @ts-expect-error not a measure or dimension of either dataset
+			if (key === 'margn') return false
 			return ctx.roles.includes(access)
 		}
+	})
+
+	test('access keys stay literal, and unmarked fields add none', () => {
+		expectTypeOf<AccessKey<typeof sales>>().toEqualTypeOf<'staff'>()
+		expectTypeOf<AccessKey<typeof orders>>().toEqualTypeOf<never>()
+		expectTypeOf(
+			dimension.number(order.col('amount'), { label: 'x', access: 'finance' })
+				.access
+		).toEqualTypeOf<'finance' | undefined>()
 	})
 
 	test('marked fields keep their query and result types', () => {

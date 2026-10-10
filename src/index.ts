@@ -1,4 +1,5 @@
 export {
+	type AccessKey,
 	type Analytics,
 	AnalyticsError,
 	type AnalyticsErrorCode,
@@ -11,6 +12,7 @@ export {
 	type AnalyticsSource,
 	createAnalytics,
 	type DatasetCatalogEntry,
+	type FieldKey,
 	isAnalyticsError
 } from './analytics.js'
 export {

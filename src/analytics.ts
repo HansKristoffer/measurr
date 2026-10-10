@@ -1,6 +1,11 @@
 import { z } from 'zod'
 import type { CompiledStatement, Dialect, SelectStatement } from './compile.js'
-import type { AnyDataset, AnyDimension, AnyMeasure } from './dataset.js'
+import type {
+	AnyDataset,
+	AnyDimension,
+	AnyMeasure,
+	Dataset
+} from './dataset.js'
 import {
 	type NormalizedQuery,
 	type ParsedQuery,
@@ -111,6 +116,16 @@ export type AnalyticsQueryEvent = {
 	error?: unknown
 }
 
+/** The measure and dimension keys of a dataset (of any dataset, for a union). */
+export type FieldKey<D> =
+	D extends Dataset<string, infer M, infer Dm> ? keyof (M & Dm) & string : never
+
+/** The access keys a dataset's measures and dimensions are marked with. */
+export type AccessKey<D> =
+	D extends Dataset<string, infer M, infer Dm>
+		? NonNullable<(M & Dm)[keyof (M & Dm)]['access']>
+		: never
+
 export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	datasets: DS
 	/** Databases by name; a dataset's `source` picks one, or the only one is used. */
@@ -134,13 +149,13 @@ export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	 * `access`. Called only for marked fields, once per access key: a ratio also needs the
 	 * access of the measures it divides. Required when any field is marked. It decides which
 	 * fields `listDatasets(ctx)` and `querySchema({ ctx })` offer, and is checked again on every
-	 * query.
+	 * query. `access` is the union of the keys the datasets use, so a new key shows up here.
 	 */
 	authorizeField?:
 		| ((
 				dataset: DS[number],
-				key: string,
-				access: string,
+				key: FieldKey<DS[number]>,
+				access: AccessKey<DS[number]>,
 				ctx: Ctx
 		  ) => boolean | Promise<boolean>)
 		| undefined
@@ -317,7 +332,15 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		ctx: Ctx
 	): Promise<RestrictedField[]> => {
 		const restricted = restrictedOf.get(dataset.key) ?? []
-		const { authorizeField } = options
+		// Keys and access marks are read from the datasets themselves, so they fit the hook.
+		const authorizeField = options.authorizeField as
+			| ((
+					dataset: AnyDataset,
+					key: string,
+					access: string,
+					ctx: Ctx
+			  ) => boolean | Promise<boolean>)
+			| undefined
 		// createAnalytics refuses marked fields without the hook; deny them all regardless.
 		if (restricted.length === 0 || !authorizeField) return restricted
 
@@ -795,7 +818,10 @@ function withoutFields(
 ): AnyDataset {
 	if (fields.length === 0) return dataset
 
-	const keep = (kind: RestrictedField['kind'], entries: object) =>
+	const keep = <Field>(
+		kind: RestrictedField['kind'],
+		entries: Record<string, Field>
+	): Record<string, Field> =>
 		Object.fromEntries(
 			Object.entries(entries).filter(
 				([key]) =>

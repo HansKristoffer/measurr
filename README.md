@@ -134,7 +134,9 @@ them:
   fields are open to everyone who may query the dataset. The hook is called only for marked
   fields, once per access key, and is required as soon as one field is marked
   (`createAnalytics` throws otherwise). A `ratio` also needs the access of the measures it
-  divides, so a margin rate is as restricted as the margin.
+  divides, so a margin rate is as restricted as the margin. The hook's `access` is typed as the
+  union of the keys the datasets use (`AccessKey`) and `key` as their field keys (`FieldKey`),
+  so a new key such as `'finance'` fails an exhaustive `switch` in the hook until it is handled.
 - A dataset without a tenant column is only for a `ctx` whose `tenant(ctx)` is `allTenants`
   (see below).
 
@@ -425,9 +427,9 @@ Kept stable for publishing: `createAnalytics` and its options (with `authorize` 
 (with `access`), `table` / `Table`, the expression builders; the `Dialect`,
 `SqlRenderer` and `AnalyticsSource` contracts; `postgresDialect`, `checkDatasetContract` /
 `assertDatasetContract`; and the types `AnalyticsQuery`, `AnalyticsResult`, `ResultPeriod`,
-`PeriodInput`, `Tenant`, `TenantId`, `Ratio`, `AnalyticsError` codes and their details
-(`isAnalyticsError`). `ExprNode` and `SelectStatement` are
-exported for dialect authors and may grow new node kinds.
+`PeriodInput`, `Tenant`, `TenantId`, `AccessKey`, `FieldKey`, `Ratio`, `AnalyticsError` codes
+and their details (`isAnalyticsError`). `ExprNode` and `SelectStatement` are exported for
+dialect authors and may grow new node kinds.
 
 ## Install
 
