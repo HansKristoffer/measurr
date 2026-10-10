@@ -1,6 +1,6 @@
 {
 	"name": "measurr",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "A small typed semantic layer: datasets of measures and dimensions compiled to one SQL statement per dialect.",
 	"type": "module",
 	"module": "./dist/index.js",
