@@ -283,14 +283,16 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 
 	/** One schema per set of datasets (or views of them without some fields). */
 	const querySchemaFor = (selected: readonly AnyDataset[]) => {
-		const selectionKey = selected
-			.map((dataset) =>
-				byKey.get(dataset.key) === dataset
-					? dataset.key
-					: `${dataset.key}(${Object.keys(dataset.measures)}|${Object.keys(dataset.dimensions)})`
-			)
-			.sort()
-			.join(',')
+		const keyOf = (dataset: AnyDataset) => {
+			if (byKey.get(dataset.key) === dataset) return dataset.key
+
+			const fields = [
+				...Object.keys(dataset.measures),
+				...Object.keys(dataset.dimensions)
+			]
+			return `${dataset.key}(${fields.join(' ')})`
+		}
+		const selectionKey = selected.map(keyOf).sort().join(',')
 
 		let schema = querySchemas.get(selectionKey)
 		if (!schema) {
@@ -319,17 +321,16 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		// createAnalytics refuses marked fields without the hook; deny them all regardless.
 		if (restricted.length === 0 || !authorizeField) return restricted
 
-		const allowed = await Promise.all(
-			restricted.map(async (field) =>
-				(
-					await Promise.all(
-						field.access.map((access) =>
-							authorizeField(dataset, field.key, access, ctx)
-						)
-					)
-				).every(Boolean)
+		const mayUse = async (field: RestrictedField) => {
+			const answers = await Promise.all(
+				field.access.map((access) =>
+					authorizeField(dataset, field.key, access, ctx)
+				)
 			)
-		)
+			return answers.every(Boolean)
+		}
+
+		const allowed = await Promise.all(restricted.map(mayUse))
 		return restricted.filter((_, index) => !allowed[index])
 	}
 
@@ -381,20 +382,20 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		}
 
 		// Sorting names only asked measures and grouped dimensions, so these cover it.
-		const named = new Set([
-			...parsedQuery.measures.map((key) => `measure ${key}`),
-			...[
-				...(parsedQuery.groupBy ?? []),
-				...(parsedQuery.filters ?? []).map((filter) => filter.dimension)
-			].map((key) => `dimension ${key}`)
-		])
-		const refused = (await deniedFields(dataset, ctx))
-			.map((field) => `${field.kind} ${field.key}`)
-			.filter((field) => named.has(field))
+		const dimensionsUsed = [
+			...(parsedQuery.groupBy ?? []),
+			...(parsedQuery.filters ?? []).map((filter) => filter.dimension)
+		]
+		const refused = (await deniedFields(dataset, ctx)).filter((field) =>
+			field.kind === 'measure'
+				? parsedQuery.measures.includes(field.key)
+				: dimensionsUsed.includes(field.key)
+		)
 		if (refused.length > 0) {
+			const names = refused.map((field) => `${field.kind} ${field.key}`)
 			throw new AnalyticsError(
 				'forbidden',
-				`Not allowed to use ${refused.join(', ')} of ${dataset.key}`
+				`Not allowed to use ${names.join(', ')} of ${dataset.key}`
 			)
 		}
 

@@ -76,7 +76,7 @@ describe('tenant hook', () => {
 })
 
 describe('datasets without a tenant column', () => {
-	test('say so with tenantColumn: null; leaving it out fails', () => {
+	test('take tenantColumn: null; leaving it out fails', () => {
 		typeOnly(() => {
 			// @ts-expect-error tenantColumn is required: a column, or null
 			defineDataset({

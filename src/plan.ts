@@ -222,7 +222,6 @@ function baseWhere(
 				`Dataset ${dataset.key} has no tenant column; only allTenants may query it`
 			)
 		}
-		const tenantColumn = dataset.tenantColumn
 		const ids = typeof tenant === 'object' ? [...new Set(tenant)] : [tenant]
 		const [only] = ids
 		// One id compiles exactly like the scalar; an empty list renders as a false condition.
@@ -231,12 +230,12 @@ function baseWhere(
 				? {
 						kind: 'compare',
 						op: '=',
-						left: tenantColumn,
+						left: dataset.tenantColumn,
 						right: param(only)
 					}
 				: {
 						kind: 'in',
-						item: tenantColumn,
+						item: dataset.tenantColumn,
 						values: ids.map(param),
 						negated: false
 					}

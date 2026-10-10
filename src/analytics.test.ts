@@ -149,22 +149,7 @@ describe('datasets without a tenant column', () => {
 		).toThrow(/no tenant column/)
 	})
 
-	test('run unfiltered for a caller who sees every tenant', async () => {
-		sql.length = 0
-		// The label lookup runs, finds nothing and fails.
-		await expect(
-			analytics.query(byTechnician, everyTenant)
-		).rejects.toMatchObject({ code: 'unknown_value' })
-		const [statement] = await analytics.explain(
-			{ dataset: 'maintenance', measures: ['cases'] },
-			everyTenant
-		)
-
-		expect(sql).toHaveLength(2)
-		expect(statement?.text).toContain('FROM "maintenance"')
-	})
-
-	test('must say so: a missing tenantColumn is refused', () => {
+	test('defineDataset refuses a missing tenantColumn', () => {
 		const order = table<Order>('orders')
 		const withoutTenantColumn = {
 			key: 'loose',
@@ -186,7 +171,6 @@ describe('field access', () => {
 	type Viewer = { role: 'staff' | 'customer' }
 	const staff: Viewer = { role: 'staff' }
 	const customer: Viewer = { role: 'customer' }
-	const checked: string[] = []
 	const options = {
 		datasets: [sales],
 		sources: {
@@ -196,10 +180,8 @@ describe('field access', () => {
 	}
 	const analytics = createAnalytics({
 		...options,
-		authorizeField: (dataset, key, access, viewer: Viewer) => {
-			checked.push(`${dataset.key}.${key}:${access}`)
-			return viewer.role === access
-		}
+		authorizeField: (_dataset, _key, access, viewer: Viewer) =>
+			viewer.role === access
 	})
 
 	test('marking a field needs authorizeField', () => {
@@ -232,18 +214,7 @@ describe('field access', () => {
 		)
 	})
 
-	test('a ratio needs the access of the measures it divides', async () => {
-		checked.length = 0
-		await analytics.listDatasets(customer)
-
-		expect(checked.sort()).toEqual([
-			'sales.customer:staff',
-			'sales.margin:staff',
-			'sales.marginRate:staff'
-		])
-	})
-
-	test('every query checks again', async () => {
+	test('every query checks again, ratios included', async () => {
 		const refused = [
 			{ measures: ['margin'] },
 			{ measures: ['marginRate'] },

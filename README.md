@@ -223,8 +223,8 @@ lookups resolve labels across tenants, so `"Complaint"` matches every tenant's t
 name.
 
 **Datasets without tenants.** Some tables belong to no organization, such as maintenance
-cases staff work on. Declare them with `tenantColumn: null` (the key stays required, so a
-forgotten tenant column still fails typecheck):
+cases staff work on. Declare them with `tenantColumn: null`. The key stays required, so a
+forgotten tenant column still fails typecheck.
 
 ```ts
 export const maintenance = defineDataset({
@@ -393,9 +393,9 @@ empty tenant and an empty tenant list see nothing (tenant isolation), and day bu
 far-from-UTC timezone (default `Pacific/Auckland`) agree with single-day periods. Fields marked
 with `access` are checked like any other.
 
-A dataset without a tenant column has no tenant rows to isolate. Pass `tenant: allTenants`;
-instead of the isolation checks, the kit checks that an empty tenant and an empty tenant list
-are refused with `forbidden`, and runs everything else as usual:
+A dataset without a tenant column has no tenant rows to isolate. Pass `tenant: allTenants`,
+and the kit replaces the isolation checks with one that an empty tenant and an empty tenant
+list are refused with `forbidden`. Every other check runs as usual.
 
 ```ts
 await assertDatasetContract({ dataset: maintenance, source, tenant: allTenants })
