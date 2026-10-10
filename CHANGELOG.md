@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/HansKristoffer/measurr/compare/v0.2.0...v0.3.0) (2026-10-10)
+
+
+### Features
+
+* tenant lists and all-time periods ([#3](https://github.com/HansKristoffer/measurr/issues/3)) ([0638bc2](https://github.com/HansKristoffer/measurr/commit/0638bc2f6ef47bbdea68cb4fdb05e288b15b5b8b))
+
 ## [0.2.0](https://github.com/HansKristoffer/measurr/compare/v0.1.0...v0.2.0) (2026-10-07)
 
 
