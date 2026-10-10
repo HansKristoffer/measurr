@@ -36,7 +36,9 @@ export type ResolvedPeriod = {
 }
 
 export const MAX_PERIOD_DAYS = 731
-export const DEFAULT_PERIOD: PeriodInput = { last: { days: 30 } }
+export const DEFAULT_PERIOD = {
+	last: { days: 30 }
+} as const satisfies PeriodInput
 
 const DAY_MS = 86_400_000
 

@@ -237,7 +237,10 @@ timezone. `time` picks the time field the period applies to; a time dimension na
 `{ all: true }` drops the time filter: every row counts, and time buckets and parts still group
 by the time field. It has no previous period, so `compareToPrevious` with it is an
 `invalid_query`. The result's `period` is then `{ all: true, timezone }` instead of
-`{ from, to, timezone }` (the `ResultPeriod` type); `previous.period` is always a range.
+`{ from, to, timezone }`; `previous.period` is always a range. The type follows the query: a
+query that names a range, or names none on a dataset whose default is a range, has
+`result.period.from`; a query typed only as `AnalyticsQuery` (parsed from the schema) gets
+`ResultPeriod`, the union, to narrow with `'all' in result.period`.
 
 A query that names no period (or sends null) gets the dataset's `defaultPeriod`, the last 30
 days unless the dataset says otherwise. A dataset that describes current state (units,

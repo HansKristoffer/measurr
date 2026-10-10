@@ -114,8 +114,30 @@ export type ResultPeriod =
 	| { from: string; to: string; timezone: string }
 	| { all: true; timezone: string }
 
-export type QueryResult<Row, Totals> = {
-	period: ResultPeriod
+/** The period a result covers: the one `Q` names, or the dataset default `Default`. */
+type ResultPeriodOf<Default, Q> = PeriodShape<
+	| NonNullable<GivenPeriod<Q>>
+	| (null extends GivenPeriod<Q>
+			? Default
+			: undefined extends GivenPeriod<Q>
+				? Default
+				: never)
+>
+type GivenPeriod<Q> = Q extends unknown
+	? 'period' extends keyof Q
+		? Q['period' & keyof Q]
+		: undefined
+	: never
+type PeriodShape<P> = P extends { all: true }
+	? Extract<ResultPeriod, { all: true }>
+	: Exclude<ResultPeriod, { all: true }>
+
+export type QueryResult<
+	Row,
+	Totals,
+	Period extends ResultPeriod = ResultPeriod
+> = {
+	period: Period
 	rows: Row[]
 	totals: Totals
 	/** Only for a range: an all-time period has no previous period. */
@@ -130,9 +152,13 @@ export type QueryResult<Row, Totals> = {
 
 /** The typed result of query `Q` against the datasets `DS`. */
 export type ResultOf<DS, Q> =
-	DS extends Dataset<infer K, infer M, infer Dm, string>
+	DS extends Dataset<infer K, infer M, infer Dm, string, infer P>
 		? Q extends { dataset: K; measures: readonly (infer Mk extends string)[] }
-			? QueryResult<ResultRow<M, Dm, Mk, GroupKeys<Q>>, ResultTotals<M, Mk>>
+			? QueryResult<
+					ResultRow<M, Dm, Mk, GroupKeys<Q>>,
+					ResultTotals<M, Mk>,
+					ResultPeriodOf<P, Q>
+				>
 			: never
 		: never
 
