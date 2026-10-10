@@ -4,6 +4,7 @@ import {
 	type AnalyticsQuery,
 	type AnalyticsResult,
 	type Ratio,
+	type ResultPeriod,
 	createAnalytics,
 	defineDataset,
 	dimension,
@@ -26,6 +27,7 @@ import {
 	type Region,
 	type RegionId,
 	STATUS_LABELS,
+	orderBook,
 	orders
 } from './fixtures/orders.js'
 
@@ -55,6 +57,18 @@ describe('tenant hook', () => {
 				sources: { main: source },
 				// @ts-expect-error any other symbol is not a tenant
 				tenant: () => Symbol('all')
+			})
+			createAnalytics({
+				datasets: [orders],
+				sources: { main: source },
+				tenant: (ctx: { organizationIds: readonly string[] }) =>
+					ctx.organizationIds
+			})
+			createAnalytics({
+				datasets: [orders],
+				sources: { main: source },
+				// @ts-expect-error allTenants is never part of a list
+				tenant: () => [allTenants]
 			})
 		})
 	})
@@ -428,12 +442,71 @@ describe('nullability', () => {
 	})
 })
 
+describe('result periods', () => {
+	type Range = { from: string; to: string; timezone: string }
+	type AllTime = { all: true; timezone: string }
+	const both = createAnalytics({
+		datasets: [orders, orderBook],
+		sources: { main: source },
+		tenant: () => 't'
+	})
+	type PeriodOf<Q> = AnalyticsResult<typeof both, Q>['period']
+
+	test('follow the query, or the dataset default when it names none', () => {
+		expectTypeOf(orderBook.defaultPeriod).toEqualTypeOf<{
+			readonly all: true
+		}>()
+		expectTypeOf<
+			PeriodOf<{ dataset: 'orders'; measures: ['orders'] }>
+		>().toEqualTypeOf<Range>()
+		expectTypeOf<
+			PeriodOf<{
+				dataset: 'orders'
+				measures: ['orders']
+				period: { all: true }
+			}>
+		>().toEqualTypeOf<AllTime>()
+		expectTypeOf<
+			PeriodOf<{ dataset: 'orderBook'; measures: ['orders']; period: null }>
+		>().toEqualTypeOf<AllTime>()
+		expectTypeOf<
+			PeriodOf<{
+				dataset: 'orderBook'
+				measures: ['orders']
+				period: { preset: 'today' }
+			}>
+		>().toEqualTypeOf<Range>()
+	})
+
+	test('a query typed only as the schema gives either', () => {
+		expectTypeOf<
+			PeriodOf<AnalyticsQuery<typeof both>>
+		>().toEqualTypeOf<ResultPeriod>()
+	})
+
+	test('a literal query needs no narrowing', () => {
+		typeOnly(async () => {
+			const result = await both.query(
+				{ dataset: 'orders', measures: ['orders'] },
+				{}
+			)
+			expectTypeOf(result.period.from).toEqualTypeOf<string>()
+		})
+	})
+})
+
 describe('integrations', () => {
 	test('schema output can be passed straight to query', () => {
 		typeOnly(async () => {
 			const input = analytics.querySchema().parse({})
 			const result = await analytics.query(input, { tenantId: 't' })
-			expectTypeOf(result.period.from).toEqualTypeOf<string>()
+			expectTypeOf(result.period).toEqualTypeOf<ResultPeriod>()
+			if ('from' in result.period)
+				expectTypeOf(result.period.from).toEqualTypeOf<string>()
+			// Only a range has a previous period.
+			expectTypeOf(result.previous?.period.from).toEqualTypeOf<
+				string | undefined
+			>()
 		})
 	})
 })

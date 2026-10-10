@@ -9,6 +9,7 @@ import {
 	directChildren,
 	rootOf
 } from './expr.js'
+import { DEFAULT_PERIOD, type PeriodInput } from './period.js'
 
 declare const ratioBrand: unique symbol
 
@@ -532,7 +533,8 @@ export type Dataset<
 	K extends string = string,
 	M extends Record<string, AnyMeasure> = Record<string, AnyMeasure>,
 	Dm extends Record<string, AnyDimension> = Record<string, AnyDimension>,
-	T extends string = string
+	T extends string = string,
+	P extends PeriodInput = PeriodInput
 > = {
 	readonly key: K
 	readonly label: string
@@ -543,6 +545,8 @@ export type Dataset<
 	readonly scope: ExprNode | null
 	readonly time: Readonly<Record<T, TimeField>>
 	readonly defaultTime: T
+	/** Kept as a type, so results know whether a query without a period covers all time. */
+	readonly defaultPeriod: P
 	readonly measures: M
 	readonly dimensions: Dm
 }
@@ -571,7 +575,8 @@ export type DatasetDefinition<
 	K extends string,
 	M extends Record<string, AnyMeasure>,
 	Dm extends Record<string, AnyDimension>,
-	T extends string
+	T extends string,
+	P extends PeriodInput
 > = {
 	key: K
 	label: string
@@ -587,6 +592,11 @@ export type DatasetDefinition<
 	time: Record<T, { column: Expr<'timestamp'>; label: string }>
 	/** The time field periods apply to when a query names none; the first one by default. */
 	defaultTime?: NoInfer<T> | undefined
+	/**
+	 * The period of a query that names none; the last 30 days by default. A dataset of current
+	 * state (units, organizations) sets `{ all: true }`.
+	 */
+	defaultPeriod?: P | undefined
 	measures: M & CheckMeasures<M>
 	dimensions: Dm & CheckDimensions<Dm, NoInfer<T>>
 }
@@ -599,8 +609,9 @@ export function defineDataset<
 	const K extends string,
 	const M extends Record<string, AnyMeasure>,
 	const Dm extends Record<string, AnyDimension>,
-	const T extends string
->(definition: DatasetDefinition<K, M, Dm, T>): Dataset<K, M, Dm, T> {
+	const T extends string,
+	const P extends PeriodInput = typeof DEFAULT_PERIOD
+>(definition: DatasetDefinition<K, M, Dm, T, P>): Dataset<K, M, Dm, T, P> {
 	const timeEntries = Object.entries<{
 		column: Expr<'timestamp'>
 		label: string
@@ -619,7 +630,7 @@ export function defineDataset<
 		])
 	) as Record<T, TimeField>
 
-	const dataset: Dataset<K, M, Dm, T> = {
+	const dataset: Dataset<K, M, Dm, T, P> = {
 		key: definition.key,
 		label: definition.label,
 		description: definition.description,
@@ -629,6 +640,8 @@ export function defineDataset<
 		scope: definition.scope?.node ?? null,
 		time,
 		defaultTime: definition.defaultTime ?? (firstTime[0] as T),
+		// P is DEFAULT_PERIOD's type when the definition names no period.
+		defaultPeriod: definition.defaultPeriod ?? (DEFAULT_PERIOD as P),
 		measures: definition.measures,
 		dimensions: definition.dimensions
 	}

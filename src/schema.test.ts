@@ -2,10 +2,10 @@ import { describe, expect, test } from 'bun:test'
 import { z } from 'zod'
 import { createAnalytics } from './index.js'
 import { postgresDialect } from './dialects/postgres.js'
-import { orders } from './fixtures/orders.js'
+import { orderBook, orders } from './fixtures/orders.js'
 
 const analytics = createAnalytics({
-	datasets: [orders],
+	datasets: [orders, orderBook],
 	sources: { main: { dialect: postgresDialect(), execute: async () => [] } },
 	tenant: () => 'tenant-1'
 })
@@ -24,6 +24,56 @@ describe('query schema', () => {
 		expect(json).toContain('refundRate: Refund rate')
 		expect(json).toContain('An order with several tags counts once per tag.')
 		expect(json).toContain('"enum":["OPEN","PAID","REFUNDED"]')
+	})
+
+	test('names each dataset default period', () => {
+		const json = JSON.stringify(z.toJSONSchema(schema))
+
+		expect(json).toContain(
+			'Which days to count, in the organization timezone. Defaults to the last 30 days.'
+		)
+		expect(json).toContain('Defaults to all time (no time filter).')
+	})
+
+	test('an all-time period has no previous period', () => {
+		expect(
+			issuesOf({
+				dataset: 'orders',
+				measures: ['orders'],
+				period: { all: true }
+			})
+		).toEqual([])
+		const message = 'An all-time period has no previous period to compare with'
+		expect(
+			issuesOf({
+				dataset: 'orders',
+				measures: ['orders'],
+				period: { all: true },
+				compareToPrevious: true
+			})
+		).toEqual([message])
+		expect(
+			issuesOf({
+				dataset: 'orderBook',
+				measures: ['orders'],
+				compareToPrevious: true
+			})
+		).toEqual([message])
+		expect(
+			issuesOf({
+				dataset: 'orderBook',
+				measures: ['orders'],
+				period: { preset: 'thisMonth' },
+				compareToPrevious: true
+			})
+		).toEqual([])
+		expect(
+			issuesOf({
+				dataset: 'orders',
+				measures: ['orders'],
+				period: { all: false }
+			})
+		).not.toEqual([])
 	})
 
 	test('accepts a full query', () => {
@@ -123,5 +173,15 @@ describe('query schema', () => {
 		expect(analytics.resultSchema('orders').safeParse(result).success).toBe(
 			true
 		)
+		const allTime = { ...result, period: { all: true, timezone: 'UTC' } }
+		expect(analytics.resultSchema('orders').safeParse(allTime).success).toBe(
+			true
+		)
+		expect(
+			analytics.resultSchema('orders').safeParse({
+				...allTime,
+				previous: { period: allTime.period, rows: [], totals: {} }
+			}).success
+		).toBe(false)
 	})
 })

@@ -15,7 +15,7 @@ import {
 	createAnalytics
 } from './index.js'
 import { postgresDialect } from './dialects/postgres.js'
-import { type RegionId, orders } from './fixtures/orders.js'
+import { type RegionId, orderBook, orders } from './fixtures/orders.js'
 import { assertDatasetContract } from './testing.js'
 
 const url = process.env.ANALYTICS_TEST_DATABASE_URL
@@ -79,9 +79,9 @@ describe.skipIf(!url)('postgres integration', () => {
 	}
 	const analyticsIn = (timezone: string) =>
 		createAnalytics({
-			datasets: [orders],
+			datasets: [orders, orderBook],
 			sources: { main: source },
-			tenant: (ctx: { tenantId: string }) => ctx.tenantId,
+			tenant: (ctx: { tenantId: string | readonly string[] }) => ctx.tenantId,
 			timezone: () => timezone,
 			now: () => NOW
 		})
@@ -272,6 +272,59 @@ describe.skipIf(!url)('postgres integration', () => {
 		).toBe(6)
 	})
 
+	test('a tenant list counts its tenants, an empty list counts nothing', async () => {
+		const query = {
+			dataset: 'orders',
+			measures: ['orders'],
+			filters: [{ dimension: 'tag', op: 'in', values: ['complaint'] }]
+		} as const
+		const count = async (tenantId: readonly string[]) =>
+			(await analytics.query(query, { tenantId })).totals.orders
+
+		// B's "other" tag is also named Complaint; the lookup resolves it in the list too.
+		expect(await count(['A', 'B'])).toBe(3)
+		expect(await count(['B'])).toBe(1)
+		expect(
+			(
+				await analytics.query(
+					{ dataset: 'orders', measures: ['orders'], groupBy: ['status'] },
+					{ tenantId: [] }
+				)
+			).rows
+		).toEqual([])
+		await expect(count([])).rejects.toMatchObject({ code: 'unknown_value' })
+	})
+
+	test('all-time periods count every row and still bucket by time', async () => {
+		const byStatus = await analytics.query(
+			{ dataset: 'orderBook', measures: ['orders'], groupBy: ['status'] },
+			tenantA
+		)
+		const byMonth = await analytics.query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['month'],
+				period: { all: true }
+			},
+			tenantA
+		)
+
+		expect(byStatus.period).toEqual({ all: true, timezone: 'UTC' })
+		expect(byStatus.rows.map((row) => [row.status.key, row.orders])).toEqual([
+			['PAID', 3],
+			['OPEN', 1],
+			['REFUNDED', 1]
+		])
+		expect(byMonth.rows.map((row) => [row.month.key, row.orders])).toEqual([
+			['2026-08-01', 1],
+			['2026-09-01', 1],
+			['2026-10-01', 3]
+		])
+		expect(byMonth.totals.orders).toBe(5)
+		expect(AnalyticsResultSchema.parse(byMonth)).toEqual(byMonth)
+	})
+
 	test('an unknown value lists the valid ones', async () => {
 		const error = await analytics
 			.query(
@@ -347,6 +400,13 @@ describe.skipIf(!url)('postgres integration', () => {
 		})
 
 		expect(report.checks.length).toBeGreaterThan(20)
+		await assertDatasetContract({
+			dataset: orderBook,
+			source,
+			tenant: 'A',
+			period: { all: true },
+			now: () => NOW
+		})
 	})
 
 	test('the contract kit catches buckets in the wrong timezone', async () => {

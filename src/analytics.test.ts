@@ -212,6 +212,19 @@ describe('AnalyticsResultSchema', () => {
 		expect(AnalyticsResultSchema.parse(result)).toEqual(result)
 	})
 
+	test('an all-time result says so', async () => {
+		const analytics = analyticsWith({ rows: [{ m_orders: 9 }] })
+
+		const result = await analytics.query(
+			{ dataset: 'orders', measures: ['orders'], period: { all: true } },
+			ctx
+		)
+
+		expect(result.period).toEqual({ all: true, timezone: 'UTC' })
+		expect(result.previous).toBeUndefined()
+		expect(AnalyticsResultSchema.parse(result)).toEqual(result)
+	})
+
 	test('rejects what no dataset returns', () => {
 		expect(
 			AnalyticsResultSchema.safeParse({

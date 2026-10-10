@@ -6,6 +6,7 @@ import {
 	type ParsedQuery,
 	type PlanContext,
 	type Tenant,
+	type TenantId,
 	allTenants,
 	normalizeQuery,
 	planLookup,
@@ -115,9 +116,10 @@ export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	/** Databases by name; a dataset's `source` picks one, or the only one is used. */
 	sources: Record<string, AnalyticsSource>
 	/**
-	 * The tenant every query is scoped to. Queries without one (null, undefined, '') are
-	 * refused. Return `allTenants` to drop the tenant filter, only for callers allowed to see
-	 * every tenant's rows.
+	 * The tenant every query is scoped to, or a list of them (an empty list matches no rows).
+	 * Queries without one (null, undefined, '', a list holding one of those) are refused.
+	 * Return `allTenants` to drop the tenant filter, only for callers allowed to see every
+	 * tenant's rows.
 	 */
 	tenant: (ctx: Ctx) => Tenant | null | undefined
 	/**
@@ -207,7 +209,8 @@ type Prepared = {
 	query: NormalizedQuery
 	tenant: Tenant
 	timezone: string
-	period: ResolvedPeriod
+	/** Null for all time. */
+	period: ResolvedPeriod | null
 	previous: ResolvedPeriod | null
 	now: Date
 }
@@ -326,16 +329,19 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 
 		const query = normalizeQuery(dataset, parsed.data as ParsedQuery)
 		const at = now()
-		let period: ResolvedPeriod
+		let period: ResolvedPeriod | null
 		try {
-			period = resolvePeriod(query.period, timezone, at)
+			period =
+				'all' in query.period ? null : resolvePeriod(query.period, timezone, at)
 		} catch (error) {
 			if (error instanceof PeriodError) {
 				throw new AnalyticsError('invalid_period', error.message)
 			}
 			throw error
 		}
-		const previous = query.compareToPrevious ? previousPeriod(period) : null
+		// The schema refuses compareToPrevious with an all-time period.
+		const previous =
+			query.compareToPrevious && period ? previousPeriod(period) : null
 
 		return { dataset, query, tenant, timezone, period, previous, now: at }
 	}
@@ -357,7 +363,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			dialect
 		)
 
-		const runPeriod = async (target: ResolvedPeriod) => {
+		const runPeriod = async (target: ResolvedPeriod | null) => {
 			const statements = periodStatements(dataset, query, {
 				tenant,
 				timezone,
@@ -373,27 +379,26 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			const { rows, truncated } = shapeRows(dataset, query, rawRows, dialect)
 			const totalsRow = (rawTotals ?? rawRows)[0] ?? {}
 			const totals = shapeMeasures(dataset, query.measures, totalsRow, dialect)
-			const periodOut = { from: target.from, to: target.to, timezone }
 
-			return { period: periodOut, rows, totals, truncated }
+			return { rows, totals, truncated }
 		}
 
+		const range = ({ from, to }: ResolvedPeriod) => ({ from, to, timezone })
 		const [current, before] = await Promise.all([
 			runPeriod(period),
-			previous ? runPeriod(previous) : null
+			previous &&
+				runPeriod(previous).then(({ rows, totals }) => ({
+					period: range(previous),
+					rows,
+					totals
+				}))
 		])
 
 		return {
-			period: current.period,
+			period: period ? range(period) : { all: true, timezone },
 			rows: current.rows,
 			totals: current.totals,
-			...(before && {
-				previous: {
-					period: before.period,
-					rows: before.rows,
-					totals: before.totals
-				}
-			}),
+			...(before && { previous: before }),
 			notes: resultNotes(dataset, query),
 			truncated: current.truncated
 		}
@@ -487,12 +492,20 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 }
 
 /**
- * Fails closed: only a non-empty string, a finite number or `allTenants` scopes a query, even
- * when a JavaScript caller's hook returns something its type does not allow.
+ * Fails closed: only a non-empty string, a finite number, a list of those or `allTenants`
+ * scopes a query, even when a JavaScript caller's hook returns something its type does not
+ * allow.
  */
 function isTenant(value: unknown): value is Tenant {
 	return (
 		value === allTenants ||
+		isTenantId(value) ||
+		(Array.isArray(value) && value.every(isTenantId))
+	)
+}
+
+function isTenantId(value: unknown): value is TenantId {
+	return (
 		(typeof value === 'string' && value !== '') ||
 		(typeof value === 'number' && Number.isFinite(value))
 	)

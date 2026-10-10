@@ -65,11 +65,12 @@ export {
 } from './expr.js'
 export { analyticsToolGuidance } from './guidance.js'
 export type { PeriodInput, PeriodPreset } from './period.js'
-export { allTenants, type Tenant } from './plan.js'
+export { allTenants, type Tenant, type TenantId } from './plan.js'
 export {
 	AnalyticsResultSchema,
 	type DatasetFilter,
 	type DatasetQuery,
 	type QueryResult,
-	type ResultOf
+	type ResultOf,
+	type ResultPeriod
 } from './query.js'

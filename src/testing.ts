@@ -11,6 +11,7 @@ import {
 	measure
 } from './dataset.js'
 import type { PeriodInput } from './period.js'
+import type { TenantId } from './plan.js'
 import { MAX_MEASURES } from './query.js'
 
 export type ContractCheck = {
@@ -78,14 +79,14 @@ export async function checkDatasetContract(
 	const analytics = createAnalytics({
 		datasets: [probe],
 		sources: { main: options.source },
-		tenant: (ctx: { tenant: string | number }) => ctx.tenant,
+		tenant: (ctx: { tenant: TenantId | readonly TenantId[] }) => ctx.tenant,
 		timezone: () => timezone,
 		...(options.now && { now: options.now })
 	})
 
 	const run = async (
 		query: Record<string, unknown>,
-		tenant: string | number = options.tenant
+		tenant: TenantId | readonly TenantId[] = options.tenant
 	): Promise<ProbeResult> => {
 		const input = { dataset: dataset.key, period, limit: 100, ...query }
 		return (await analytics.query(input as never, {
@@ -204,33 +205,36 @@ export async function checkDatasetContract(
 		}
 	}
 
-	await check('tenant isolation', async () => {
-		const measures = Object.keys(probe.measures)
-		const leaked: [string, number | null][] = []
-		for (let start = 0; start < measures.length; start += MAX_MEASURES) {
-			const batch = measures.slice(start, start + MAX_MEASURES)
-			const other = await run({ measures: batch }, emptyTenant)
-			leaked.push(
-				...Object.entries(other.totals).filter(
-					([, value]) => value !== 0 && value !== null
+	// An empty tenant list is a scope that matches nothing, never a missing filter.
+	for (const [name, tenant] of [
+		['an empty tenant', emptyTenant],
+		['an empty tenant list', []]
+	] as const) {
+		await check(`tenant isolation: ${name}`, async () => {
+			const measures = Object.keys(probe.measures)
+			const leaked: [string, number | null][] = []
+			for (let start = 0; start < measures.length; start += MAX_MEASURES) {
+				const batch = measures.slice(start, start + MAX_MEASURES)
+				const result = await run({ measures: batch }, tenant)
+				leaked.push(
+					...Object.entries(result.totals).filter(
+						([, value]) => value !== 0 && value !== null
+					)
 				)
-			)
-		}
-		if (leaked.length > 0) {
-			return `an empty tenant sees ${leaked.map(([key, value]) => `${key}=${value}`).join(', ')}`
-		}
+			}
+			if (leaked.length > 0) {
+				return `${name} sees ${leaked.map(([key, value]) => `${key}=${value}`).join(', ')}`
+			}
 
-		for (const [key, entry] of dimensions) {
-			if (!entry.groupable) continue
-			const grouped = await run(
-				{ measures: [COUNT], groupBy: [key] },
-				emptyTenant
-			)
-			if (grouped.rows.length > 0)
-				return `an empty tenant sees ${grouped.rows.length} ${key} groups`
-		}
-		return undefined
-	})
+			for (const [key, entry] of dimensions) {
+				if (!entry.groupable) continue
+				const grouped = await run({ measures: [COUNT], groupBy: [key] }, tenant)
+				if (grouped.rows.length > 0)
+					return `${name} sees ${grouped.rows.length} ${key} groups`
+			}
+			return undefined
+		})
+	}
 
 	for (const time of Object.keys(dataset.time)) {
 		await check(`day buckets of ${time} in ${timezone}`, async () => {
