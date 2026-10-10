@@ -9,6 +9,7 @@ import {
 	directChildren,
 	rootOf
 } from './expr.js'
+import { DEFAULT_PERIOD, type PeriodInput } from './period.js'
 
 declare const ratioBrand: unique symbol
 
@@ -543,6 +544,7 @@ export type Dataset<
 	readonly scope: ExprNode | null
 	readonly time: Readonly<Record<T, TimeField>>
 	readonly defaultTime: T
+	readonly defaultPeriod: PeriodInput
 	readonly measures: M
 	readonly dimensions: Dm
 }
@@ -587,6 +589,11 @@ export type DatasetDefinition<
 	time: Record<T, { column: Expr<'timestamp'>; label: string }>
 	/** The time field periods apply to when a query names none; the first one by default. */
 	defaultTime?: NoInfer<T> | undefined
+	/**
+	 * The period of a query that names none; the last 30 days by default. A dataset of current
+	 * state (units, organizations) sets `{ all: true }`.
+	 */
+	defaultPeriod?: PeriodInput | undefined
 	measures: M & CheckMeasures<M>
 	dimensions: Dm & CheckDimensions<Dm, NoInfer<T>>
 }
@@ -629,6 +636,7 @@ export function defineDataset<
 		scope: definition.scope?.node ?? null,
 		time,
 		defaultTime: definition.defaultTime ?? (firstTime[0] as T),
+		defaultPeriod: definition.defaultPeriod ?? DEFAULT_PERIOD,
 		measures: definition.measures,
 		dimensions: definition.dimensions
 	}

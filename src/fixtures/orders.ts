@@ -134,3 +134,29 @@ export const orders = defineDataset({
 		hour: dimension.timePart('created', 'hour')
 	}
 })
+
+/** Current state: every order counts unless a query names a period. */
+export const orderBook = defineDataset({
+	key: 'orderBook',
+	label: 'Order book',
+	description: 'Every order, whenever it was created.',
+	from: order,
+	tenantColumn: order.col('tenantId'),
+	scope: eq(order.col('isTest'), false),
+	time: { created: { column: order.col('createdAt'), label: 'Created' } },
+	defaultPeriod: { all: true },
+	measures: { orders: measure.count({ label: 'Orders' }) },
+	dimensions: {
+		status: dimension.enum(order.col('status'), OrderStatus, {
+			label: 'Status',
+			labels: STATUS_LABELS
+		}),
+		region: dimension.relation({
+			label: 'Region',
+			key: region.col('id'),
+			name: region.col('name'),
+			empty: 'No region'
+		}),
+		month: dimension.timeBucket('created', 'month')
+	}
+})

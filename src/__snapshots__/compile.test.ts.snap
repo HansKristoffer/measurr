@@ -86,3 +86,48 @@ FROM "orders" AS "orders"
 WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2) AND ("orders"."shippedAt" >= $3) AND ("orders"."shippedAt" < $4)
 -- values: ["tenant-1",false,"2026-08-31 22:00:00.000","2026-09-30 22:00:00.000"]"
 `;
+
+exports[`postgres compiler monthlyAllTime 1`] = `
+"SELECT to_char(date_trunc('month', (("orders"."createdAt") AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Copenhagen')), 'YYYY-MM-DD') AS "g_month", count(*) AS "m_orders"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2)
+GROUP BY 1
+ORDER BY "g_month" ASC
+LIMIT 21
+-- values: ["tenant-1",false]
+
+SELECT count(*) AS "m_orders"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2)
+-- values: ["tenant-1",false]"
+`;
+
+exports[`postgres compiler stateByStatus 1`] = `
+"SELECT "orders"."status" AS "g_status", count(*) AS "m_orders"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2)
+GROUP BY 1
+ORDER BY "m_orders" DESC, "g_status" ASC
+LIMIT 21
+-- values: ["tenant-1",false]
+
+SELECT count(*) AS "m_orders"
+FROM "orders" AS "orders"
+WHERE ("orders"."tenantId" = $1) AND ("orders"."isTest" = $2)
+-- values: ["tenant-1",false]"
+`;
+
+exports[`postgres compiler tenant list 1`] = `
+"SELECT "orders"."status" AS "g_status", "regions"."id" AS "g_region", "regions"."name" AS "g_region__label", count(*) AS "m_orders", count(DISTINCT "orders"."customerId") AS "m_customers"
+FROM "orders" AS "orders" LEFT JOIN "regions" AS "regions" ON ("regions"."id" = "orders"."regionId")
+WHERE ("orders"."tenantId" IN ($1, $2)) AND ("orders"."isTest" = $3) AND ("orders"."createdAt" >= $4) AND ("orders"."createdAt" < $5) AND (("orders"."status" NOT IN ($6)) OR ("orders"."status" IS NULL)) AND ("regions"."id" IS NOT NULL)
+GROUP BY 1, 2, 3
+ORDER BY "m_customers" DESC, "g_status" ASC, "g_region" ASC
+LIMIT 11
+-- values: ["tenant-1","tenant-2",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","OPEN"]
+
+SELECT count(*) AS "m_orders", count(DISTINCT "orders"."customerId") AS "m_customers"
+FROM "orders" AS "orders" LEFT JOIN "regions" AS "regions" ON ("regions"."id" = "orders"."regionId")
+WHERE ("orders"."tenantId" IN ($1, $2)) AND ("orders"."isTest" = $3) AND ("orders"."createdAt" >= $4) AND ("orders"."createdAt" < $5) AND (("orders"."status" NOT IN ($6)) OR ("orders"."status" IS NULL)) AND ("regions"."id" IS NOT NULL)
+-- values: ["tenant-1","tenant-2",false,"2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","OPEN"]"
+`;

@@ -6,11 +6,7 @@ import type {
 } from './compile.js'
 import type { AnyDataset, AnyDimension, AnyMeasure } from './dataset.js'
 import type { ExprNode, ParamValue } from './expr.js'
-import {
-	DEFAULT_PERIOD,
-	type PeriodInput,
-	type ResolvedPeriod
-} from './period.js'
+import type { PeriodInput, ResolvedPeriod } from './period.js'
 import { DEFAULT_LIMIT } from './query.js'
 
 /** A parsed query with every default filled in and duplicates removed. */
@@ -65,7 +61,7 @@ export function normalizeQuery(
 		// Order matters: the first grouped dimension leads the rows.
 		groupBy: [...new Set(parsed.groupBy ?? [])],
 		filters,
-		period: parsed.period ?? DEFAULT_PERIOD,
+		period: parsed.period ?? dataset.defaultPeriod,
 		time: parsed.time ?? dataset.defaultTime,
 		compareToPrevious: parsed.compareToPrevious ?? false,
 		sort: parsed.sort
@@ -81,14 +77,17 @@ export function normalizeQuery(
  */
 export const allTenants: unique symbol = Symbol('measurr.allTenants')
 
-/** One tenant's id, or `allTenants`. */
-export type Tenant = string | number | typeof allTenants
+export type TenantId = string | number
+
+/** One tenant's id, a list of them (an empty list matches no rows), or `allTenants`. */
+export type Tenant = TenantId | readonly TenantId[] | typeof allTenants
 
 /** What the planner needs besides the query: values from the hooks and resolved labels. */
 export type PlanContext = {
 	tenant: Tenant
 	timezone: string
-	period: ResolvedPeriod
+	/** Null for an all-time period: no time filter. */
+	period: ResolvedPeriod | null
 	/** The moment the query runs. */
 	now: Date
 	/** Keys for filters on open dimensions, after label resolution, by dimension. */
@@ -215,17 +214,26 @@ function baseWhere(
 	tenant: Tenant,
 	period: { time: string; start: Date; end: Date } | null
 ): ExprNode[] {
-	const where: ExprNode[] =
-		tenant === allTenants
-			? []
-			: [
-					{
+	const where: ExprNode[] = []
+	if (tenant !== allTenants) {
+		const ids = typeof tenant === 'object' ? [...new Set(tenant)] : [tenant]
+		// One id compiles exactly like the scalar; an empty list renders as a false condition.
+		where.push(
+			ids.length === 1 && ids[0] !== undefined
+				? {
 						kind: 'compare',
 						op: '=',
 						left: dataset.tenantColumn,
-						right: param(tenant)
+						right: param(ids[0])
 					}
-				]
+				: {
+						kind: 'in',
+						item: dataset.tenantColumn,
+						values: ids.map(param),
+						negated: false
+					}
+		)
+	}
 	if (dataset.scope) where.push(dataset.scope)
 
 	if (period) {
@@ -357,11 +365,15 @@ export function planQuery(
 	}
 
 	const where = [
-		...baseWhere(dataset, context.tenant, {
-			time: query.time,
-			start: context.period.start,
-			end: context.period.end
-		}),
+		...baseWhere(
+			dataset,
+			context.tenant,
+			context.period && {
+				time: query.time,
+				start: context.period.start,
+				end: context.period.end
+			}
+		),
 		...query.filters.map((filter) => filterNode(dataset, filter, context))
 	]
 

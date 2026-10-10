@@ -13,10 +13,14 @@ export type PeriodPreset =
 	| 'lastMonth'
 	| 'thisYear'
 
-export type PeriodInput =
+/** A range of days: what `resolvePeriod` turns into instants. */
+export type PeriodRange =
 	| { last: { days: number } }
 	| { from: string; to: string }
 	| { preset: PeriodPreset }
+
+/** A range of days, or `{ all: true }` for no time filter. */
+export type PeriodInput = PeriodRange | { all: true }
 
 export type ResolvedPeriod = {
 	/** First local day, `YYYY-MM-DD`. */
@@ -140,7 +144,7 @@ export class PeriodError extends Error {
 
 /** Resolves a period input to local days and instants in `timezone`. */
 export function resolvePeriod(
-	input: PeriodInput,
+	input: PeriodRange,
 	timezone: string,
 	now: Date
 ): ResolvedPeriod {
@@ -154,7 +158,7 @@ export function resolvePeriod(
 	return periodFromDays(from, to, timezone)
 }
 
-function periodDays(input: PeriodInput, today: string): [string, string] {
+function periodDays(input: PeriodRange, today: string): [string, string] {
 	if ('last' in input) return [addDays(today, -(input.last.days - 1)), today]
 	if ('from' in input) return [input.from, input.to]
 

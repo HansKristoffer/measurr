@@ -109,10 +109,16 @@ export type ResultTotals<M, MeasureKey extends string> = Simplify<{
 	[Key in MeasureKey & keyof M]: MeasureValue<M[Key]>
 }>
 
+/** The days a result covers: local days `from` to `to` (inclusive), or all time. */
+export type ResultPeriod =
+	| { from: string; to: string; timezone: string }
+	| { all: true; timezone: string }
+
 export type QueryResult<Row, Totals> = {
-	period: { from: string; to: string; timezone: string }
+	period: ResultPeriod
 	rows: Row[]
 	totals: Totals
+	/** Only for a range: an all-time period has no previous period. */
 	previous?: {
 		period: { from: string; to: string; timezone: string }
 		rows: Row[]
@@ -135,24 +141,29 @@ export type ResultOf<DS, Q> =
 
 const isoDate = z.iso.date().describe('A date, YYYY-MM-DD.')
 
-export const periodSchema = z
-	.union([
-		z.object({
-			last: z.object({
-				days: z
-					.number()
-					.int()
-					.min(1)
-					.max(MAX_PERIOD_DAYS)
-					.describe('Number of days, ending today.')
-			})
-		}),
-		z.object({ from: isoDate, to: isoDate.describe('Last day, inclusive.') }),
-		z.object({ preset: z.enum(PERIOD_PRESETS) })
-	])
-	.describe(
-		'Which days to count, in the organization timezone. Defaults to the last 30 days. At most two years.'
-	)
+const periodSchema = z.union([
+	z.object({
+		last: z.object({
+			days: z
+				.number()
+				.int()
+				.min(1)
+				.max(MAX_PERIOD_DAYS)
+				.describe('Number of days, ending today.')
+		})
+	}),
+	z.object({ from: isoDate, to: isoDate.describe('Last day, inclusive.') }),
+	z.object({ preset: z.enum(PERIOD_PRESETS) }),
+	z.object({ all: z.literal(true) }).describe('Every row, with no time filter.')
+])
+
+/** How the schema names a dataset's default period, so a model knows what omitting it means. */
+function describePeriod(period: PeriodInput): string {
+	if ('all' in period) return 'all time (no time filter)'
+	if ('last' in period) return `the last ${period.last.days} days`
+	if ('from' in period) return `${period.from} to ${period.to}`
+	return period.preset
+}
 
 function describeList(
 	entries: [string, { label: string; description?: string | undefined }][]
@@ -285,7 +296,11 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 					.describe('Every filter must match.')
 			}),
 			// Nullable as well: LLM tool callers send null for a field they leave out.
-			period: periodSchema.nullish(),
+			period: periodSchema
+				.describe(
+					`Which days to count, in the organization timezone. Defaults to ${describePeriod(dataset.defaultPeriod)}. A range covers at most two years.`
+				)
+				.nullish(),
 			...(timeKeys && {
 				time: z
 					.enum(timeKeys)
@@ -297,7 +312,9 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 			compareToPrevious: z
 				.boolean()
 				.optional()
-				.describe('Also return the previous period of the same length.'),
+				.describe(
+					'Also return the previous period of the same length. Not for all-time periods.'
+				),
 			sort: z
 				.object({
 					by: z.enum(sortKeys),
@@ -328,6 +345,14 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 					message: `Sort by one of the asked measures or grouped dimensions: ${returned.join(', ')}`
 				})
 			}
+			const period = query.period ?? dataset.defaultPeriod
+			if (query.compareToPrevious && 'all' in period) {
+				context.addIssue({
+					code: 'custom',
+					path: ['compareToPrevious'],
+					message: 'An all-time period has no previous period to compare with'
+				})
+			}
 		})
 }
 
@@ -339,11 +364,15 @@ export function buildQuerySchema(datasets: readonly AnyDataset[]) {
 	return z.discriminatedUnion('dataset', [first, ...rest])
 }
 
-const periodOutput = z.object({
+const rangeOutput = z.object({
 	from: z.string(),
 	to: z.string(),
 	timezone: z.string()
 })
+const periodOutput = z.union([
+	rangeOutput,
+	z.object({ all: z.literal(true), timezone: z.string() })
+])
 const measureValue = z.number().nullable()
 const dimensionValue = z.object({
 	key: z.union([z.string(), z.number()]).nullable(),
@@ -360,7 +389,7 @@ function resultSchemaOf<Row extends z.ZodType, Totals extends z.ZodType>(
 		rows: z.array(row),
 		totals,
 		previous: z
-			.object({ period: periodOutput, rows: z.array(row), totals })
+			.object({ period: rangeOutput, rows: z.array(row), totals })
 			.optional(),
 		notes: z.array(z.string()),
 		truncated: z.boolean()

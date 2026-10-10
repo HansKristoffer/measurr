@@ -12,21 +12,27 @@ import {
 	gt,
 	measure,
 	minutesAgo,
+	type Tenant,
 	table
 } from './index.js'
 import { postgresDialect } from './dialects/postgres.js'
-import { type Order, type Refund, orders } from './fixtures/orders.js'
+import {
+	type Order,
+	type Refund,
+	orderBook,
+	orders
+} from './fixtures/orders.js'
 
 const NOW = new Date('2026-10-07T10:00:00Z')
 
 function analyticsFor(
 	dialect: Dialect,
-	datasets: readonly AnyDataset[] = [orders]
+	datasets: readonly AnyDataset[] = [orders, orderBook]
 ) {
 	return createAnalytics({
 		datasets,
 		sources: { main: { dialect, execute: async () => [] } },
-		tenant: (ctx: { tenantId: string }) => ctx.tenantId,
+		tenant: (ctx: { tenantId: string | readonly string[] }) => ctx.tenantId,
 		timezone: () => 'Europe/Copenhagen',
 		now: () => NOW
 	})
@@ -73,6 +79,17 @@ const QUERIES = {
 		groupBy: ['weekday', 'hour'],
 		time: 'shipped',
 		period: { from: '2026-09-01', to: '2026-09-30' }
+	},
+	monthlyAllTime: {
+		dataset: 'orders',
+		measures: ['orders'],
+		groupBy: ['month'],
+		period: { all: true }
+	},
+	stateByStatus: {
+		dataset: 'orderBook',
+		measures: ['orders'],
+		groupBy: ['status']
 	}
 } as const
 
@@ -92,6 +109,16 @@ describe('postgres compiler', () => {
 			expect(render(await analytics.explain(query, ctx))).toMatchSnapshot()
 		})
 	}
+
+	test('tenant list', async () => {
+		expect(
+			render(
+				await analytics.explain(QUERIES.byStatusAndRegion, {
+					tenantId: ['tenant-1', 'tenant-2']
+				})
+			)
+		).toMatchSnapshot()
+	})
 })
 
 describe('planner rules', () => {
@@ -183,6 +210,127 @@ describe('planner rules', () => {
 					organizationId: ''
 				})
 			).rejects.toMatchObject({ code: 'missing_tenant' })
+		})
+	})
+
+	describe('tenant lists', () => {
+		const sql: string[] = []
+		const listed = createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text }) => {
+						sql.push(text)
+						return []
+					}
+				}
+			},
+			tenant: (ctx: { tenants: unknown }) => ctx.tenants as Tenant,
+			now: () => NOW
+		})
+
+		test('every statement and lookup filters by the list', async () => {
+			sql.length = 0
+			await expect(
+				listed.query(
+					{
+						dataset: 'orders',
+						measures: ['orders'],
+						filters: [{ dimension: 'tag', op: 'in', values: ['Complaint'] }]
+					},
+					{ tenants: ['org-1', 'org-2'] }
+				)
+			).rejects.toMatchObject({ code: 'unknown_value' })
+			const statements = await listed.explain(QUERIES.weeklyComputed, {
+				tenants: ['org-1', 'org-2', 'org-1']
+			})
+
+			expect(sql).toHaveLength(2)
+			for (const text of [...sql, ...statements.map((s) => s.text)]) {
+				expect(text).toMatch(/\("orders"\."tenantId" IN \(\$\d+, \$\d+\)\)/)
+			}
+			// Duplicates are dropped.
+			expect(
+				statements[0]?.values.filter((value) => String(value).startsWith('org'))
+			).toEqual(['org-1', 'org-2'])
+		})
+
+		test('one id compiles exactly like the scalar', async () => {
+			expect(
+				await listed.explain(QUERIES.byStatusAndRegion, { tenants: ['org-1'] })
+			).toEqual(
+				await listed.explain(QUERIES.byStatusAndRegion, { tenants: 'org-1' })
+			)
+		})
+
+		test('an empty list matches no rows instead of every tenant', async () => {
+			for (const statement of await listed.explain(QUERIES.weeklyComputed, {
+				tenants: []
+			})) {
+				expect(statement.text).toStartWith('SELECT')
+				expect(statement.text).toContain('WHERE (1 = 0) AND')
+			}
+		})
+
+		test('a list with anything but tenant ids is refused', async () => {
+			for (const tenants of [
+				['org-1', ''],
+				['org-1', null],
+				[Number.NaN],
+				[allTenants],
+				[['org-1']]
+			]) {
+				await expect(
+					listed.explain(QUERIES.ungrouped, { tenants })
+				).rejects.toMatchObject({ code: 'missing_tenant' })
+			}
+		})
+	})
+
+	describe('all-time periods', () => {
+		const timeFilter = '"orders"."createdAt" >='
+
+		test('drop the time filter and keep time buckets', async () => {
+			const [rows, totals] = await analytics.explain(
+				QUERIES.monthlyAllTime,
+				ctx
+			)
+
+			expect(rows?.text).not.toContain(timeFilter)
+			expect(rows?.text).toContain("date_trunc('month'")
+			expect(totals?.text).not.toContain(timeFilter)
+		})
+
+		test('a dataset default applies when the query names no period', async () => {
+			const byDefault = await analytics.explain(
+				{ dataset: 'orderBook', measures: ['orders'], period: null },
+				ctx
+			)
+			const named = await analytics.explain(
+				{
+					dataset: 'orderBook',
+					measures: ['orders'],
+					period: { last: { days: 7 } }
+				},
+				ctx
+			)
+			const [orderDefault] = await analytics.explain(QUERIES.ungrouped, ctx)
+
+			expect(byDefault[0]?.text).not.toContain(timeFilter)
+			expect(named[0]?.text).toContain(timeFilter)
+			expect(orderDefault?.text).toContain(timeFilter)
+		})
+
+		test('cannot compare with a previous period', async () => {
+			for (const query of [
+				{ ...QUERIES.monthlyAllTime, compareToPrevious: true },
+				{ ...QUERIES.stateByStatus, compareToPrevious: true }
+			]) {
+				await expect(analytics.explain(query, ctx)).rejects.toMatchObject({
+					code: 'invalid_query'
+				})
+			}
 		})
 	})
 

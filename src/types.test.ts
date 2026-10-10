@@ -56,6 +56,18 @@ describe('tenant hook', () => {
 				// @ts-expect-error any other symbol is not a tenant
 				tenant: () => Symbol('all')
 			})
+			createAnalytics({
+				datasets: [orders],
+				sources: { main: source },
+				tenant: (ctx: { organizationIds: readonly string[] }) =>
+					ctx.organizationIds
+			})
+			createAnalytics({
+				datasets: [orders],
+				sources: { main: source },
+				// @ts-expect-error allTenants is never part of a list
+				tenant: () => [allTenants]
+			})
 		})
 	})
 })
@@ -433,7 +445,16 @@ describe('integrations', () => {
 		typeOnly(async () => {
 			const input = analytics.querySchema().parse({})
 			const result = await analytics.query(input, { tenantId: 't' })
-			expectTypeOf(result.period.from).toEqualTypeOf<string>()
+			expectTypeOf(result.period).toEqualTypeOf<
+				| { from: string; to: string; timezone: string }
+				| { all: true; timezone: string }
+			>()
+			if ('from' in result.period)
+				expectTypeOf(result.period.from).toEqualTypeOf<string>()
+			// Only a range has a previous period.
+			expectTypeOf(result.previous?.period.from).toEqualTypeOf<
+				string | undefined
+			>()
 		})
 	})
 })
