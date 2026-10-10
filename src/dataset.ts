@@ -19,6 +19,12 @@ export type Ratio = number & { readonly [ratioBrand]: 'zeroToOne' }
 type Described = {
 	label: string
 	description?: string | undefined
+	/**
+	 * Restricts the field to callers `authorizeField` allows for this access key (a string the
+	 * app defines, such as `'staff'`). Unmarked fields are open to everyone who may query the
+	 * dataset.
+	 */
+	access?: string | undefined
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -37,6 +43,7 @@ export type AggregateMeasure<
 	readonly result: R
 	readonly label: string
 	readonly description: string | undefined
+	readonly access: string | undefined
 	readonly node: Extract<ExprNode, { kind: 'aggregate' }>
 }
 
@@ -45,6 +52,7 @@ export type ShareMeasure = {
 	readonly result: 'ratio'
 	readonly label: string
 	readonly description: string | undefined
+	readonly access: string | undefined
 	readonly numerator: ExprNode
 	readonly denominator: ExprNode | null
 }
@@ -57,6 +65,8 @@ export type RatioMeasure<
 	readonly result: 'ratio'
 	readonly label: string
 	readonly description: string | undefined
+	/** A ratio also needs the access of the measures it divides. */
+	readonly access: string | undefined
 	readonly numerator: A
 	readonly denominator: B
 }
@@ -83,6 +93,7 @@ function aggregate<R extends 'count' | 'number'>(
 		result,
 		label: options.label,
 		description: options.description,
+		access: options.access,
 		node: {
 			kind: 'aggregate',
 			fn,
@@ -141,6 +152,7 @@ export const measure = {
 			result: 'ratio',
 			label: options.label,
 			description: options.description,
+			access: options.access,
 			numerator: options.numerator.node,
 			denominator: options.denominator?.node ?? null
 		}
@@ -160,6 +172,7 @@ export const measure = {
 			result: 'ratio',
 			label: options.label,
 			description: options.description,
+			access: options.access,
 			numerator,
 			denominator
 		}
@@ -211,6 +224,7 @@ type DimensionBase<C extends DimensionCategory, Key> = {
 	readonly category: C
 	readonly label: string
 	readonly description: string | undefined
+	readonly access: string | undefined
 	readonly groupable: boolean
 	readonly filterable: boolean
 	/** Phantom: the key type in result rows. */
@@ -317,6 +331,7 @@ function base(options: DimensionOptions) {
 	return {
 		label: options.label,
 		description: options.description,
+		access: options.access,
 		groupable: options.filterOnly !== true,
 		filterable: options.groupOnly !== true
 	}
@@ -541,7 +556,8 @@ export type Dataset<
 	readonly description: string
 	readonly from: TableRef
 	readonly source: string | undefined
-	readonly tenantColumn: ExprNode
+	/** Null for a dataset without tenants, which only `allTenants` may query. */
+	readonly tenantColumn: ExprNode | null
 	readonly scope: ExprNode | null
 	readonly time: Readonly<Record<T, TimeField>>
 	readonly defaultTime: T
@@ -585,8 +601,12 @@ export type DatasetDefinition<
 	from: { readonly ref: TableRef }
 	/** Which source (database) the dataset runs on; the default when there is one source. */
 	source?: string | undefined
-	/** The column every query is filtered by; the value comes from `tenant(ctx)`. */
-	tenantColumn: Expr<SqlType>
+	/**
+	 * The column every query is filtered by; the value comes from `tenant(ctx)`. `null` for a
+	 * dataset whose rows belong to no tenant (staff work, platform-wide records): only a caller
+	 * whose `tenant(ctx)` is `allTenants` may query it, and everyone else is refused.
+	 */
+	tenantColumn: Expr<SqlType> | null
 	/** Always applied, for example excluding test rows. */
 	scope?: Expr<'boolean'> | undefined
 	time: Record<T, { column: Expr<'timestamp'>; label: string }>
@@ -623,6 +643,13 @@ export function defineDataset<
 		)
 	}
 
+	// A JavaScript caller that leaves it out must not get a dataset without tenants.
+	if (definition.tenantColumn === undefined) {
+		throw new Error(
+			`Dataset ${definition.key}: declare tenantColumn, or null for a dataset without tenants`
+		)
+	}
+
 	const time = Object.fromEntries(
 		timeEntries.map(([key, field]) => [
 			key,
@@ -636,7 +663,7 @@ export function defineDataset<
 		description: definition.description,
 		from: definition.from.ref,
 		source: definition.source,
-		tenantColumn: definition.tenantColumn.node,
+		tenantColumn: definition.tenantColumn?.node ?? null,
 		scope: definition.scope?.node ?? null,
 		time,
 		defaultTime: definition.defaultTime ?? (firstTime[0] as T),
@@ -675,7 +702,7 @@ function validateDataset<DS extends AnyDataset>(dataset: DS): DS {
 		})
 	}
 
-	check(dataset.tenantColumn, 'tenantColumn')
+	if (dataset.tenantColumn) check(dataset.tenantColumn, 'tenantColumn')
 	if (dataset.scope) check(dataset.scope, 'scope')
 	for (const [key, field] of Object.entries<TimeField>(dataset.time)) {
 		check(field.column, `time field ${key}`)

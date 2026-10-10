@@ -12,10 +12,12 @@ returns shaped, typed rows.
 - Tenant-scoped by construction: the engine adds the tenant filter to every statement and
   refuses to run without a tenant. A caller can be scoped to one tenant or a list of them;
   platform admins can query every tenant only through an explicit `allTenants` value that no
-  query input can carry.
+  query input can carry. A dataset without tenants (staff work) is only for those admins.
+- Access per dataset and per field: a staff-only measure lives on the same dataset as the
+  measures everyone may use.
 - The query schema is generated with Zod, so it doubles as an LLM tool schema
   (`z.toJSONSchema`) and as the request validator. It can be built per caller, offering only
-  the datasets they may query.
+  the datasets and fields they may use.
 - No driver or ORM dependency. `zod` is a peer dependency.
 
 ## Quick start
@@ -51,6 +53,11 @@ export const orders = defineDataset({
 	measures: {
 		orders: measure.count({ label: 'Orders' }),
 		revenue: measure.sum(order.col('amount'), { label: 'Revenue' }),
+		// Only callers `authorizeField` allows for 'staff' see or query it.
+		margin: measure.sum(order.col('amount').sub(order.col('cost')), {
+			label: 'Margin',
+			access: 'staff'
+		}),
 		refunded: measure.countWhere(exists(refund, eq(refund.col('orderId'), order.col('id'))), {
 			label: 'Refunded orders'
 		}),
@@ -96,6 +103,7 @@ export const analytics = createAnalytics({
 	},
 	tenant: (ctx: Ctx) => ctx.organizationId,
 	authorize: (dataset, ctx) => ctx.can(`analytics:${dataset.key}`),
+	authorizeField: (dataset, key, access, ctx) => ctx.roles.includes(access),
 	timezone: (ctx) => ctx.timezone,
 	onQuery: (event, ctx) => metrics.record(event.dataset, event.durationMs, event.outcome)
 })
@@ -117,18 +125,36 @@ result.rows[0]?.paidShare // Ratio | null
 
 ## Callers and tools
 
-`authorize` is the one access rule. Everything that offers datasets goes through it:
+Three rules decide what a caller may use, and everything that offers datasets goes through
+them:
+
+- `authorize(dataset, ctx)` decides which datasets `ctx` may query (all when omitted).
+- `authorizeField(dataset, key, access, ctx)` decides which marked measures and dimensions it
+  may use. A field is marked with `access`, a string your app defines (`'staff'`); unmarked
+  fields are open to everyone who may query the dataset. The hook is called only for marked
+  fields, once per access key, and is required as soon as one field is marked
+  (`createAnalytics` throws otherwise). A `ratio` also needs the access of the measures it
+  divides, so a margin rate is as restricted as the margin.
+- A dataset without a tenant column is only for a `ctx` whose `tenant(ctx)` is `allTenants`
+  (see below).
+
+With them:
 
 - `analytics.listDatasets(ctx)` resolves to the catalog entries (measures, dimensions, closed
-  values) of the datasets `ctx` may query.
-- `analytics.querySchema({ ctx })` resolves to the input schema for those datasets, for a tool
-  built per caller. It rejects with `AnalyticsError('forbidden')` when nothing is allowed.
+  values) of the datasets `ctx` may query, without the fields it may not use. A dataset with
+  no measure left for `ctx` is left out.
+- `analytics.querySchema({ ctx })` resolves to the input schema for the same datasets and
+  fields, for a tool built per caller, so a model is never offered what it may not use. It
+  rejects with `AnalyticsError('forbidden')` when nothing is allowed.
   `analytics.querySchema({ datasets })` is the synchronous form for a list you already have
-  (typed for those datasets only), and `querySchema()` covers every dataset. Schemas are built once per set of datasets, so
-  `querySchema({ ctx })` returns the same object as `querySchema({ datasets })` for the same
-  allowed set: cache a tool built from it by its dataset keys.
-- `analytics.query` checks `authorize` again on every call, so a schema offered too widely
-  still cannot leak a dataset.
+  (typed for those datasets only), and `querySchema()` covers every dataset and field. Schemas
+  are built once per set of datasets and fields, so `querySchema({ ctx })` returns the same
+  object as `querySchema({ datasets })` when `ctx` may use every field of the allowed set:
+  cache a tool built from it by the keys of what it offers.
+- `analytics.query` checks all three again on every call, so a schema offered too widely still
+  cannot leak a dataset or a field. Naming a field `ctx` may not use (as a measure, in
+  `groupBy` or `sort`, or in a filter) fails with `AnalyticsError('forbidden')`, which names
+  the field.
 
 `AnalyticsResultSchema` is any dataset's result without its keys: rows of `{ key, label }`
 per grouped dimension and a number or null per measure, with totals, `previous?`, `notes` and
@@ -196,13 +222,33 @@ checking the session) before building `ctx`; never read it from the query input.
 lookups resolve labels across tenants, so `"Complaint"` matches every tenant's tag of that
 name.
 
+**Datasets without tenants.** Some tables belong to no organization, such as maintenance
+cases staff work on. Declare them with `tenantColumn: null` (the key stays required, so a
+forgotten tenant column still fails typecheck):
+
+```ts
+export const maintenance = defineDataset({
+	key: 'maintenance',
+	label: 'Maintenance',
+	description: 'One row per maintenance case.',
+	from: maintenanceCase,
+	tenantColumn: null,
+	// ...
+})
+```
+
+Only a `ctx` whose `tenant(ctx)` is `allTenants` may query such a dataset, label lookups
+included. An id or a list of ids, even an empty one, fails with `AnalyticsError('forbidden')`
+before any statement runs; a narrower scope is never ignored. `listDatasets(ctx)` and
+`querySchema({ ctx })` leave the dataset out for those callers.
+
 ## The model
 
 | Concept | What it is |
 | --- | --- |
-| Dataset | One fact table: tenant column, optional scope, time fields, default period, measures, dimensions, source. |
-| Measure | `count`, `countWhere`, `countDistinct`, `sum`, `avg`, `median`, `share` (one condition over another) or `ratio` (one measure over another, after aggregation). |
-| Dimension | `enum`, `computed` (closed value sets), `relation` (to-one), `manyToMany`, `number`, `timeBucket` (day, ISO week, month), `timePart` (ISO weekday, hour). |
+| Dataset | One fact table: tenant column (or `null`), optional scope, time fields, default period, measures, dimensions, source. |
+| Measure | `count`, `countWhere`, `countDistinct`, `sum`, `avg`, `median`, `share` (one condition over another) or `ratio` (one measure over another, after aggregation). Optionally restricted with `access`. |
+| Dimension | `enum`, `computed` (closed value sets), `relation` (to-one), `manyToMany`, `number`, `timeBucket` (day, ISO week, month), `timePart` (ISO weekday, hour). Optionally restricted with `access`. |
 | Query | `dataset`, 1-4 `measures`, 0-2 `groupBy`, `filters`, `period`, `time`, `compareToPrevious`, `sort` (by an asked measure or grouped dimension), `limit` (1-100, default 20). |
 | Result | `{ period, rows, totals, previous?, notes, truncated }`; `period` is `{ from, to, timezone }` or `{ all: true, timezone }`. |
 
@@ -344,12 +390,22 @@ It checks that every measure runs and returns a number or null, every grouping r
 groups add up to the total (except many-to-many), `isEmpty` plus `isNotEmpty` equals the total,
 open dimensions filter by label to their group's count, closed dimensions filter by value, an
 empty tenant and an empty tenant list see nothing (tenant isolation), and day buckets in a
-far-from-UTC timezone (default `Pacific/Auckland`) agree with single-day periods.
+far-from-UTC timezone (default `Pacific/Auckland`) agree with single-day periods. Fields marked
+with `access` are checked like any other.
+
+A dataset without a tenant column has no tenant rows to isolate. Pass `tenant: allTenants`;
+instead of the isolation checks, the kit checks that an empty tenant and an empty tenant list
+are refused with `forbidden`, and runs everything else as usual:
+
+```ts
+await assertDatasetContract({ dataset: maintenance, source, tenant: allTenants })
+```
 
 ## Extending
 
 - **A measure or dimension** is one entry in a dataset. Dimensions are groupable and
-  filterable unless `groupOnly` or `filterOnly` says otherwise. The contract kit covers it
+  filterable unless `groupOnly` or `filterOnly` says otherwise, and every field is open to
+  everyone who may query the dataset unless `access` restricts it. The contract kit covers it
   without a new test.
 - **A dataset** is one `defineDataset` call added to `createAnalytics({ datasets })`.
 - **A computed value** is written with the expression builders (`caseWhen`, `exists`,
@@ -362,10 +418,11 @@ far-from-UTC timezone (default `Pacific/Auckland`) agree with single-day periods
 
 ## Stable API
 
-Kept stable for publishing: `createAnalytics` and its options, `allTenants`, `analytics.query`,
-`explain`, `querySchema`, `resultSchema`, `listDatasets`; `AnalyticsResultSchema`,
-`analyticsToolGuidance`, `AnalyticsQueryEvent`; `defineDataset` (with `defaultPeriod`),
-`measure.*`, `dimension.*`, `table` / `Table`, the expression builders; the `Dialect`,
+Kept stable for publishing: `createAnalytics` and its options (with `authorize` and
+`authorizeField`), `allTenants`, `analytics.query`, `explain`, `querySchema`, `resultSchema`,
+`listDatasets`; `AnalyticsResultSchema`, `analyticsToolGuidance`, `AnalyticsQueryEvent`;
+`defineDataset` (with `defaultPeriod` and `tenantColumn: null`), `measure.*` and `dimension.*`
+(with `access`), `table` / `Table`, the expression builders; the `Dialect`,
 `SqlRenderer` and `AnalyticsSource` contracts; `postgresDialect`, `checkDatasetContract` /
 `assertDatasetContract`; and the types `AnalyticsQuery`, `AnalyticsResult`, `ResultPeriod`,
 `PeriodInput`, `Tenant`, `TenantId`, `Ratio`, `AnalyticsError` codes and their details

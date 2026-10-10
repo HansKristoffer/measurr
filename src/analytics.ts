@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { CompiledStatement, Dialect, SelectStatement } from './compile.js'
-import type { AnyDataset, AnyDimension } from './dataset.js'
+import type { AnyDataset, AnyDimension, AnyMeasure } from './dataset.js'
 import {
 	type NormalizedQuery,
 	type ParsedQuery,
@@ -129,6 +129,21 @@ export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	authorize?:
 		| ((dataset: DS[number], ctx: Ctx) => boolean | Promise<boolean>)
 		| undefined
+	/**
+	 * Whether `ctx` may use the measure or dimension `key` of `dataset`, which is marked with
+	 * `access`. Called only for marked fields, once per access key: a ratio also needs the
+	 * access of the measures it divides. Required when any field is marked. It decides which
+	 * fields `listDatasets(ctx)` and `querySchema({ ctx })` offer, and is checked again on every
+	 * query.
+	 */
+	authorizeField?:
+		| ((
+				dataset: DS[number],
+				key: string,
+				access: string,
+				ctx: Ctx
+		  ) => boolean | Promise<boolean>)
+		| undefined
 	/** IANA timezone periods and time buckets resolve in. UTC when omitted. */
 	timezone?:
 		| ((
@@ -183,15 +198,15 @@ export type Analytics<DS extends readonly AnyDataset[], Ctx> = {
 		datasets?: readonly K[] | undefined
 	}): z.ZodType<DatasetQuery<Extract<DS[number], { key: K }>>>
 	/**
-	 * The input schema for the datasets `authorize` allows `ctx`, for a tool built per caller.
-	 * Rejects with `forbidden` when none are allowed.
+	 * The input schema for the datasets `ctx` may query, without the fields `authorizeField`
+	 * refuses it, for a tool built per caller. Rejects with `forbidden` when none are allowed.
 	 */
 	querySchema(options: {
 		ctx: Ctx
 	}): Promise<z.ZodType<DatasetQuery<DS[number]>>>
 	/** The result schema for one dataset. */
 	resultSchema(dataset: DS[number]['key']): z.ZodType<QueryResult<Row, Row>>
-	/** The datasets `authorize` allows `ctx`, with their measures and dimensions. */
+	/** The datasets `ctx` may query, with the measures and dimensions it may use. */
 	listDatasets(ctx: Ctx): Promise<DatasetCatalogEntry<DS[number]['key']>[]>
 }
 
@@ -202,6 +217,13 @@ export type AnalyticsResult<A, Q> =
 	A extends Analytics<infer DS, never> ? ResultOf<DS[number], Q> : never
 
 type ShapedResult = QueryResult<Row, Row>
+
+/** A measure or dimension marked with `access`, with every access key it needs. */
+type RestrictedField = {
+	kind: 'measure' | 'dimension'
+	key: string
+	access: readonly string[]
+}
 
 /** A parsed, authorized query with everything the hooks decide resolved. */
 type Prepared = {
@@ -222,6 +244,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	const sourceNames = Object.keys(options.sources)
 	const byKey = new Map<string, AnyDataset>()
 	const sourceOf = new Map<string, AnalyticsSource>()
+	const restrictedOf = new Map<string, RestrictedField[]>()
 
 	for (const dataset of datasets) {
 		if (byKey.has(dataset.key))
@@ -231,6 +254,14 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		const source = resolveSource(dataset, options.sources, sourceNames)
 		sourceOf.set(dataset.key, source)
 		compileEverything(dataset, source.dialect)
+
+		const restricted = restrictedFields(dataset)
+		if (restricted.length > 0 && !options.authorizeField) {
+			throw new Error(
+				`Dataset ${dataset.key} marks fields with access, but createAnalytics has no authorizeField`
+			)
+		}
+		restrictedOf.set(dataset.key, restricted)
 	}
 
 	const now = options.now ?? (() => new Date())
@@ -250,10 +281,14 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		return source
 	}
 
-	const querySchemaFor = (keys: readonly string[] | undefined) => {
-		const selected = keys ? keys.map(datasetOf) : datasets
+	/** One schema per set of datasets (or views of them without some fields). */
+	const querySchemaFor = (selected: readonly AnyDataset[]) => {
 		const selectionKey = selected
-			.map((dataset) => dataset.key)
+			.map((dataset) =>
+				byKey.get(dataset.key) === dataset
+					? dataset.key
+					: `${dataset.key}(${Object.keys(dataset.measures)}|${Object.keys(dataset.dimensions)})`
+			)
 			.sort()
 			.join(',')
 
@@ -274,14 +309,47 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		return schema
 	}
 
-	const allowedDatasets = async (ctx: Ctx) => {
-		const { authorize } = options
-		if (!authorize) return datasets
+	/** The marked fields of `dataset` that `ctx` may not use. */
+	const deniedFields = async (
+		dataset: AnyDataset,
+		ctx: Ctx
+	): Promise<RestrictedField[]> => {
+		const restricted = restrictedOf.get(dataset.key) ?? []
+		const { authorizeField } = options
+		// createAnalytics refuses marked fields without the hook; deny them all regardless.
+		if (restricted.length === 0 || !authorizeField) return restricted
 
 		const allowed = await Promise.all(
-			datasets.map((dataset) => authorize(dataset, ctx))
+			restricted.map(async (field) =>
+				(
+					await Promise.all(
+						field.access.map((access) =>
+							authorizeField(dataset, field.key, access, ctx)
+						)
+					)
+				).every(Boolean)
+			)
 		)
-		return datasets.filter((_, index) => allowed[index])
+		return restricted.filter((_, index) => !allowed[index])
+	}
+
+	/**
+	 * The datasets `ctx` may query, each without the fields it may not use. A dataset without
+	 * a tenant column needs `allTenants`, and one without a usable measure is left out.
+	 */
+	const allowedDatasets = async (ctx: Ctx): Promise<AnyDataset[]> => {
+		const everyTenant = options.tenant(ctx) === allTenants
+		const views = await Promise.all(
+			datasets.map(async (dataset) => {
+				if (!dataset.tenantColumn && !everyTenant) return null
+				if (options.authorize && !(await options.authorize(dataset, ctx)))
+					return null
+
+				const view = withoutFields(dataset, await deniedFields(dataset, ctx))
+				return Object.keys(view.measures).length > 0 ? view : null
+			})
+		)
+		return views.filter((view) => view !== null)
 	}
 
 	const querySchemaForCtx = async (ctx: Ctx) => {
@@ -289,12 +357,12 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		if (allowed.length === 0) {
 			throw new AnalyticsError('forbidden', 'No dataset is allowed')
 		}
-		return querySchemaFor(allowed.map((dataset) => dataset.key))
+		return querySchemaFor(allowed)
 	}
 
 	/** Parse, authorize, and resolve everything that comes from hooks. */
 	const prepare = async (input: unknown, ctx: Ctx): Promise<Prepared> => {
-		const parsed = querySchemaFor(undefined).safeParse(input)
+		const parsed = querySchemaFor(datasets).safeParse(input)
 		if (!parsed.success) {
 			throw new AnalyticsError(
 				'invalid_query',
@@ -303,11 +371,30 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			)
 		}
 
-		const dataset = datasetOf((parsed.data as ParsedQuery).dataset)
+		const parsedQuery = parsed.data as ParsedQuery
+		const dataset = datasetOf(parsedQuery.dataset)
 		if (options.authorize && !(await options.authorize(dataset, ctx))) {
 			throw new AnalyticsError(
 				'forbidden',
 				`Not allowed to query ${dataset.key}`
+			)
+		}
+
+		// Sorting names only asked measures and grouped dimensions, so these cover it.
+		const named = new Set([
+			...parsedQuery.measures.map((key) => `measure ${key}`),
+			...[
+				...(parsedQuery.groupBy ?? []),
+				...(parsedQuery.filters ?? []).map((filter) => filter.dimension)
+			].map((key) => `dimension ${key}`)
+		])
+		const refused = (await deniedFields(dataset, ctx))
+			.map((field) => `${field.kind} ${field.key}`)
+			.filter((field) => named.has(field))
+		if (refused.length > 0) {
+			throw new AnalyticsError(
+				'forbidden',
+				`Not allowed to use ${refused.join(', ')} of ${dataset.key}`
 			)
 		}
 
@@ -316,6 +403,13 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			throw new AnalyticsError(
 				'missing_tenant',
 				'Refusing to query without a tenant'
+			)
+		}
+		// Never drop a narrower scope: rows without a tenant are only for every-tenant callers.
+		if (!dataset.tenantColumn && tenant !== allTenants) {
+			throw new AnalyticsError(
+				'forbidden',
+				`${dataset.key} has no tenant column; only a caller allowed to see every tenant may query it`
 			)
 		}
 
@@ -327,7 +421,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			)
 		}
 
-		const query = normalizeQuery(dataset, parsed.data as ParsedQuery)
+		const query = normalizeQuery(dataset, parsedQuery)
 		const at = now()
 		let period: ResolvedPeriod | null
 		try {
@@ -478,10 +572,9 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		) =>
 			schemaOptions && 'ctx' in schemaOptions
 				? querySchemaForCtx(schemaOptions.ctx)
-				: querySchemaFor(schemaOptions?.datasets)) as Analytics<
-			DS,
-			Ctx
-		>['querySchema'],
+				: querySchemaFor(
+						schemaOptions?.datasets?.map(datasetOf) ?? datasets
+					)) as Analytics<DS, Ctx>['querySchema'],
 		resultSchema: (key) => resultSchemaFor(key) as z.ZodType<ShapedResult>,
 		listDatasets: async (ctx) =>
 			(await allowedDatasets(ctx)).map(
@@ -552,7 +645,7 @@ function resolveSource(
 function compileEverything(dataset: AnyDataset, dialect: Dialect): void {
 	const now = new Date(0)
 	const context: PlanContext = {
-		tenant: 'tenant',
+		tenant: dataset.tenantColumn ? 'tenant' : allTenants,
 		timezone: 'UTC',
 		period: resolvePeriod({ last: { days: 1 } }, 'UTC', now),
 		now,
@@ -662,6 +755,57 @@ function decodeKey(value: unknown, dialect: Dialect): string | number {
 	if (typeof value === 'string') return value
 
 	return dialect.decodeNumber(value) ?? String(value)
+}
+
+/**
+ * Every marked field of `dataset` with the access keys it needs: its own, and for a ratio
+ * those of the measures it divides, which it would leak otherwise.
+ */
+function restrictedFields(dataset: AnyDataset): RestrictedField[] {
+	const measures: Record<string, AnyMeasure> = dataset.measures
+	// defineDataset refuses ratio cycles.
+	const accessOf = (key: string): string[] => {
+		const entry = measures[key]
+		if (!entry) return []
+		const own = entry.access === undefined ? [] : [entry.access]
+		return entry.kind === 'ratio'
+			? [...own, ...accessOf(entry.numerator), ...accessOf(entry.denominator)]
+			: own
+	}
+
+	return [
+		...Object.keys(measures).map((key) => ({
+			kind: 'measure' as const,
+			key,
+			access: [...new Set(accessOf(key))]
+		})),
+		...Object.entries<AnyDimension>(dataset.dimensions).map(([key, entry]) => ({
+			kind: 'dimension' as const,
+			key,
+			access: entry.access === undefined ? [] : [entry.access]
+		}))
+	].filter((field) => field.access.length > 0)
+}
+
+/** `dataset` without the given fields; the dataset itself when there are none. */
+function withoutFields(
+	dataset: AnyDataset,
+	fields: readonly RestrictedField[]
+): AnyDataset {
+	if (fields.length === 0) return dataset
+
+	const keep = (kind: RestrictedField['kind'], entries: object) =>
+		Object.fromEntries(
+			Object.entries(entries).filter(
+				([key]) =>
+					!fields.some((field) => field.kind === kind && field.key === key)
+			)
+		)
+	return {
+		...dataset,
+		measures: keep('measure', dataset.measures),
+		dimensions: keep('dimension', dataset.dimensions)
+	}
 }
 
 function catalogEntry(dataset: AnyDataset): DatasetCatalogEntry {

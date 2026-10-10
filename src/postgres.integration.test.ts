@@ -15,14 +15,20 @@ import {
 	createAnalytics
 } from './index.js'
 import { postgresDialect } from './dialects/postgres.js'
-import { type RegionId, orderBook, orders } from './fixtures/orders.js'
+import {
+	type RegionId,
+	maintenance,
+	orderBook,
+	orders,
+	sales
+} from './fixtures/orders.js'
 import { assertDatasetContract } from './testing.js'
 
 const url = process.env.ANALYTICS_TEST_DATABASE_URL
 const NOW = new Date('2026-10-07T10:00:00Z')
 
 const SCHEMA = `
-DROP TABLE IF EXISTS refunds, order_tags, tags, orders, regions;
+DROP TABLE IF EXISTS refunds, order_tags, tags, orders, regions, maintenance;
 CREATE TABLE regions ("id" text PRIMARY KEY, "tenantId" text NOT NULL, "name" text NOT NULL);
 CREATE TABLE tags ("id" text PRIMARY KEY, "tenantId" text NOT NULL, "name" text NOT NULL);
 CREATE TABLE orders (
@@ -31,6 +37,7 @@ CREATE TABLE orders (
 	"customerId" text NOT NULL,
 	"status" text NOT NULL,
 	"amount" integer NOT NULL,
+	"cost" integer NOT NULL DEFAULT 0,
 	"rating" integer,
 	"regionId" text REFERENCES regions,
 	"isTest" boolean NOT NULL DEFAULT false,
@@ -40,6 +47,13 @@ CREATE TABLE orders (
 );
 CREATE TABLE order_tags ("orderId" text REFERENCES orders, "tagId" text REFERENCES tags);
 CREATE TABLE refunds ("id" text PRIMARY KEY, "orderId" text REFERENCES orders, "createdAt" timestamp(3) NOT NULL);
+CREATE TABLE maintenance (
+	"id" text PRIMARY KEY,
+	"kind" text NOT NULL,
+	"technician" text,
+	"cost" integer NOT NULL,
+	"createdAt" timestamp(3) NOT NULL
+);
 `
 
 type SeedOrder = [
@@ -128,11 +142,16 @@ describe.skipIf(!url)('postgres integration', () => {
 		await sql.unsafe(
 			`INSERT INTO refunds VALUES ('r1','o1','2026-10-03 00:00:00'),('r2','o4','2026-09-21 00:00:00')`
 		)
+		// Every amount is even, so the margin is exactly half the revenue.
+		await sql.unsafe(`UPDATE orders SET "cost" = "amount" / 2`)
+		await sql.unsafe(
+			`INSERT INTO maintenance VALUES ('m1','REPAIR','Kim',300,'2026-10-01 09:00:00'),('m2','REPAIR',NULL,100,'2026-10-02 09:00:00'),('m3','SERVICE','Kim',50,'2026-09-15 09:00:00')`
+		)
 	})
 
 	afterAll(async () => {
 		await sql.unsafe(
-			'DROP TABLE IF EXISTS refunds, order_tags, tags, orders, regions'
+			'DROP TABLE IF EXISTS refunds, order_tags, tags, orders, regions, maintenance'
 		)
 		await sql.close()
 	})
@@ -295,6 +314,57 @@ describe.skipIf(!url)('postgres integration', () => {
 		await expect(count([])).rejects.toMatchObject({ code: 'unknown_value' })
 	})
 
+	test('a dataset without a tenant column is only for every-tenant callers', async () => {
+		const everyTenant = createAnalytics({
+			datasets: [maintenance],
+			sources: { main: source },
+			tenant: (ctx: { tenantId?: string }) => ctx.tenantId ?? allTenants,
+			now: () => NOW
+		})
+		const query = {
+			dataset: 'maintenance',
+			measures: ['cases', 'cost'],
+			filters: [{ dimension: 'technician', op: 'in', values: ['kim'] }]
+		} as const
+
+		expect((await everyTenant.query(query, {})).totals).toEqual({
+			cases: 2,
+			cost: 350
+		})
+		await expect(everyTenant.query(query, tenantA)).rejects.toMatchObject({
+			code: 'forbidden'
+		})
+	})
+
+	test('staff-only fields', async () => {
+		type Viewer = { tenantId: string; role: 'staff' | 'customer' }
+		const restricted = createAnalytics({
+			datasets: [sales],
+			sources: { main: source },
+			tenant: (viewer: Viewer) => viewer.tenantId,
+			authorizeField: (_dataset, _key, access, viewer: Viewer) =>
+				viewer.role === access,
+			now: () => NOW
+		})
+		const query = {
+			dataset: 'sales',
+			measures: ['revenue', 'margin', 'marginRate']
+		} as const
+
+		const { totals } = await restricted.query(query, {
+			tenantId: 'A',
+			role: 'staff'
+		})
+		expect(totals as Record<string, unknown>).toEqual({
+			revenue: 1900,
+			margin: 950,
+			marginRate: 0.5
+		})
+		await expect(
+			restricted.query(query, { tenantId: 'A', role: 'customer' })
+		).rejects.toMatchObject({ code: 'forbidden' })
+	})
+
 	test('all-time periods count every row and still bucket by time', async () => {
 		const byStatus = await analytics.query(
 			{ dataset: 'orderBook', measures: ['orders'], groupBy: ['status'] },
@@ -407,6 +477,21 @@ describe.skipIf(!url)('postgres integration', () => {
 			period: { all: true },
 			now: () => NOW
 		})
+		await assertDatasetContract({
+			dataset: sales,
+			source,
+			tenant: 'A',
+			now: () => NOW
+		})
+		const global = await assertDatasetContract({
+			dataset: maintenance,
+			source,
+			tenant: allTenants,
+			now: () => NOW
+		})
+		expect(
+			global.checks.filter((check) => check.name.startsWith('tenant isolation'))
+		).toHaveLength(2)
 	})
 
 	test('the contract kit catches buckets in the wrong timezone', async () => {

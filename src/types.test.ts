@@ -28,7 +28,8 @@ import {
 	type RegionId,
 	STATUS_LABELS,
 	orderBook,
-	orders
+	orders,
+	sales
 } from './fixtures/orders.js'
 
 const source = { dialect: postgresDialect(), execute: async () => [] }
@@ -71,6 +72,56 @@ describe('tenant hook', () => {
 				tenant: () => [allTenants]
 			})
 		})
+	})
+})
+
+describe('datasets without a tenant column', () => {
+	test('say so with tenantColumn: null; leaving it out fails', () => {
+		typeOnly(() => {
+			// @ts-expect-error tenantColumn is required: a column, or null
+			defineDataset({
+				key: 'loose',
+				label: 'Loose',
+				description: 'No tenant column given.',
+				from: order,
+				time: { created: { column: order.col('createdAt'), label: 'Created' } },
+				measures: { orders: measure.count({ label: 'Orders' }) },
+				dimensions: {}
+			})
+		})
+	})
+})
+
+describe('field access', () => {
+	const marked = createAnalytics({
+		datasets: [orders, sales],
+		sources: { main: source },
+		tenant: () => 't',
+		authorizeField: (dataset, key, access, ctx: { roles: string[] }) => {
+			expectTypeOf(dataset.key).toEqualTypeOf<'orders' | 'sales'>()
+			expectTypeOf(key).toEqualTypeOf<string>()
+			return ctx.roles.includes(access)
+		}
+	})
+
+	test('marked fields keep their query and result types', () => {
+		type Row = AnalyticsResult<
+			typeof marked,
+			{
+				dataset: 'sales'
+				measures: ['margin', 'marginRate']
+				groupBy: ['customer']
+			}
+		>['rows'][number]
+		expectTypeOf<Row['margin']>().toEqualTypeOf<number | null>()
+		expectTypeOf<Row['marginRate']>().toEqualTypeOf<Ratio | null>()
+		expectTypeOf<Row['customer']['key']>().toEqualTypeOf<string | null>()
+
+		const schema = marked.querySchema({ datasets: ['sales'] })
+		expectTypeOf<z.infer<typeof schema>['dataset']>().toEqualTypeOf<'sales'>()
+		expectTypeOf<z.infer<typeof schema>['measures'][number]>().toEqualTypeOf<
+			'orders' | 'revenue' | 'margin' | 'marginRate'
+		>()
 	})
 })
 
