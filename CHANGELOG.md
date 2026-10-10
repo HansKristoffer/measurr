@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/HansKristoffer/measurr/compare/v0.3.0...v0.4.0) (2026-10-10)
+
+
+### Features
+
+* global datasets and per-field access ([#5](https://github.com/HansKristoffer/measurr/issues/5)) ([bf7bb24](https://github.com/HansKristoffer/measurr/commit/bf7bb2436bf2a314b66ca7e6a38a6121553b6c9c))
+
 ## [0.3.0](https://github.com/HansKristoffer/measurr/compare/v0.2.0...v0.3.0) (2026-10-10)
 
 
