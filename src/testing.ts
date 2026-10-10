@@ -3,7 +3,11 @@
  * Framework-free: `checkDatasetContract` returns a report and `assertDatasetContract` throws
  * with every failure listed, so it works from `bun:test`, vitest or a script.
  */
-import { type AnalyticsSource, createAnalytics } from './analytics.js'
+import {
+	type AnalyticsSource,
+	createAnalytics,
+	isAnalyticsError
+} from './analytics.js'
 import {
 	type AnyDataset,
 	type AnyDimension,
@@ -11,7 +15,7 @@ import {
 	measure
 } from './dataset.js'
 import type { PeriodInput } from './period.js'
-import type { TenantId } from './plan.js'
+import { type Tenant, type TenantId, allTenants } from './plan.js'
 import { MAX_MEASURES } from './query.js'
 
 export type ContractCheck = {
@@ -24,8 +28,11 @@ export type ContractReport = { ok: boolean; checks: ContractCheck[] }
 export type ContractOptions = {
 	dataset: AnyDataset
 	source: AnalyticsSource
-	/** A tenant with seeded rows in the period. */
-	tenant: string | number
+	/**
+	 * A tenant with seeded rows in the period. `allTenants` for a dataset without a tenant
+	 * column, which no single tenant may query.
+	 */
+	tenant: TenantId | typeof allTenants
 	/** A tenant with no rows; defaults to a sentinel that no real tenant uses. */
 	emptyTenant?: string | number
 	/** A timezone far from UTC makes bucketing mistakes visible. Defaults to Pacific/Auckland. */
@@ -47,8 +54,9 @@ type ProbeResult = {
 
 /**
  * Checks that every measure, grouping and filter compiles and runs, that groups add up to the
- * total, that labels resolve, that another tenant's rows never count, and that day buckets
- * agree with periods in the timezone.
+ * total, that labels resolve, that another tenant's rows never count (or, for a dataset
+ * without a tenant column, that a scoped caller is refused), and that day buckets agree with
+ * periods in the timezone. Fields marked with `access` are checked like any other.
  */
 export async function checkDatasetContract(
 	options: ContractOptions
@@ -79,14 +87,15 @@ export async function checkDatasetContract(
 	const analytics = createAnalytics({
 		datasets: [probe],
 		sources: { main: options.source },
-		tenant: (ctx: { tenant: TenantId | readonly TenantId[] }) => ctx.tenant,
+		tenant: (ctx: { tenant: Tenant }) => ctx.tenant,
+		authorizeField: () => true,
 		timezone: () => timezone,
 		...(options.now && { now: options.now })
 	})
 
 	const run = async (
 		query: Record<string, unknown>,
-		tenant: TenantId | readonly TenantId[] = options.tenant
+		tenant: Tenant = options.tenant
 	): Promise<ProbeResult> => {
 		const input = { dataset: dataset.key, period, limit: 100, ...query }
 		return (await analytics.query(input as never, {
@@ -113,10 +122,12 @@ export async function checkDatasetContract(
 
 	const total = (await run({ measures: [COUNT] })).totals[COUNT] ?? 0
 	if (total === 0) {
+		const scope =
+			options.tenant === allTenants ? 'The dataset' : `Tenant ${options.tenant}`
 		checks.push({
 			name: 'seeded rows',
 			ok: false,
-			message: `Tenant ${options.tenant} has no rows in the period; the checks below prove little`
+			message: `${scope} has no rows in the period; the checks below prove little`
 		})
 	}
 
@@ -211,6 +222,17 @@ export async function checkDatasetContract(
 		['an empty tenant list', []]
 	] as const) {
 		await check(`tenant isolation: ${name}`, async () => {
+			// Rows without a tenant cannot be isolated; a scoped caller must be refused instead.
+			if (!dataset.tenantColumn) {
+				const refused = await run({ measures: [COUNT] }, tenant).then(
+					() => false,
+					(error: unknown) => isAnalyticsError(error, 'forbidden')
+				)
+				return refused
+					? undefined
+					: `${name} may query a dataset without a tenant column`
+			}
+
 			const measures = Object.keys(probe.measures)
 			const leaked: [string, number | null][] = []
 			for (let start = 0; start < measures.length; start += MAX_MEASURES) {

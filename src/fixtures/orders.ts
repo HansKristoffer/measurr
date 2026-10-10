@@ -1,6 +1,7 @@
 /**
- * The example dataset the package's tests use: orders with a region (to-one), tags
- * (many-to-many), refunds (correlated `exists`) and two time fields.
+ * The example datasets the package's tests use: orders with a region (to-one), tags
+ * (many-to-many), refunds (correlated `exists`) and two time fields; sales with staff-only
+ * fields; and maintenance cases, which belong to no tenant.
  */
 import {
 	caseWhen,
@@ -28,6 +29,7 @@ export type Order = {
 	customerId: string
 	status: OrderStatus
 	amount: number
+	cost: number
 	rating: number | null
 	regionId: RegionId | null
 	isTest: boolean
@@ -158,5 +160,76 @@ export const orderBook = defineDataset({
 			empty: 'No region'
 		}),
 		month: dimension.timeBucket('created', 'month')
+	}
+})
+
+/** Customers, resellers and staff query sales; margin and the customer split are staff-only. */
+export const sales = defineDataset({
+	key: 'sales',
+	label: 'Sales',
+	description: 'One row per order. Test orders are excluded.',
+	from: order,
+	tenantColumn: order.col('tenantId'),
+	scope: eq(order.col('isTest'), false),
+	time: { created: { column: order.col('createdAt'), label: 'Created' } },
+	measures: {
+		orders: measure.count({ label: 'Orders' }),
+		revenue: measure.sum(order.col('amount'), { label: 'Revenue' }),
+		margin: measure.sum(order.col('amount').sub(order.col('cost')), {
+			label: 'Margin',
+			access: 'staff'
+		}),
+		marginRate: measure.ratio('margin', 'revenue', { label: 'Margin rate' })
+	},
+	dimensions: {
+		status: dimension.enum(order.col('status'), OrderStatus, {
+			label: 'Status',
+			labels: STATUS_LABELS
+		}),
+		customer: dimension.relation({
+			label: 'Customer',
+			key: order.col('customerId'),
+			name: order.col('customerId'),
+			access: 'staff'
+		})
+	}
+})
+
+export type Maintenance = {
+	id: string
+	kind: 'REPAIR' | 'SERVICE'
+	technician: string | null
+	cost: number
+	createdAt: Date
+}
+
+const maintenanceCase = table<Maintenance>('maintenance')
+
+/** Repairs done by staff: no organization owns them, so only every-tenant callers see them. */
+export const maintenance = defineDataset({
+	key: 'maintenance',
+	label: 'Maintenance',
+	description: 'One row per maintenance case.',
+	from: maintenanceCase,
+	tenantColumn: null,
+	time: {
+		created: { column: maintenanceCase.col('createdAt'), label: 'Created' }
+	},
+	measures: {
+		cases: measure.count({ label: 'Cases' }),
+		cost: measure.sum(maintenanceCase.col('cost'), { label: 'Cost' })
+	},
+	dimensions: {
+		kind: dimension.enum(
+			maintenanceCase.col('kind'),
+			{ REPAIR: 'REPAIR', SERVICE: 'SERVICE' } as const,
+			{ label: 'Kind', labels: { REPAIR: 'Repair', SERVICE: 'Service' } }
+		),
+		technician: dimension.relation({
+			label: 'Technician',
+			key: maintenanceCase.col('technician'),
+			name: maintenanceCase.col('technician'),
+			empty: 'Unassigned'
+		})
 	}
 })

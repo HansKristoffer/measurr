@@ -216,6 +216,12 @@ function baseWhere(
 ): ExprNode[] {
 	const where: ExprNode[] = []
 	if (tenant !== allTenants) {
+		// `analytics.query` refuses this first; the planner fails closed on its own too.
+		if (!dataset.tenantColumn) {
+			throw new Error(
+				`Dataset ${dataset.key} has no tenant column; only allTenants may query it`
+			)
+		}
 		const ids = typeof tenant === 'object' ? [...new Set(tenant)] : [tenant]
 		const [only] = ids
 		// One id compiles exactly like the scalar; an empty list renders as a false condition.

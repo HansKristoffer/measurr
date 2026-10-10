@@ -19,6 +19,7 @@ import { postgresDialect } from './dialects/postgres.js'
 import {
 	type Order,
 	type Refund,
+	maintenance,
 	orderBook,
 	orders
 } from './fixtures/orders.js'
@@ -109,6 +110,31 @@ describe('postgres compiler', () => {
 			expect(render(await analytics.explain(query, ctx))).toMatchSnapshot()
 		})
 	}
+
+	test('dataset without a tenant column', async () => {
+		const everyTenant = createAnalytics({
+			datasets: [maintenance],
+			sources: {
+				main: { dialect: postgresDialect(), execute: async () => [] }
+			},
+			tenant: () => allTenants,
+			now: () => NOW
+		})
+
+		expect(
+			render(
+				await everyTenant.explain(
+					{
+						dataset: 'maintenance',
+						measures: ['cases', 'cost'],
+						groupBy: ['kind'],
+						filters: [{ dimension: 'technician', op: 'isNotEmpty' }]
+					},
+					{}
+				)
+			)
+		).toMatchSnapshot()
+	})
 
 	test('tenant list', async () => {
 		expect(

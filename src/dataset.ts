@@ -16,9 +16,20 @@ declare const ratioBrand: unique symbol
 /** A share or ratio between 0 and 1. Branded so nobody renders 0.42 as "0.42%". */
 export type Ratio = number & { readonly [ratioBrand]: 'zeroToOne' }
 
-type Described = {
+type Described<Access extends string = string> = {
 	label: string
 	description?: string | undefined
+	/**
+	 * Restricts the field to callers `authorizeField` allows for this access key (a string the
+	 * app defines, such as `'staff'`). Unmarked fields are open to everyone who may query the
+	 * dataset.
+	 */
+	access?: Access | undefined
+}
+
+/** Keeps a field's access key literal, so `authorizeField` is typed with the keys in use. */
+export type Marked<Access extends string> = {
+	readonly access: Access | undefined
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -37,6 +48,7 @@ export type AggregateMeasure<
 	readonly result: R
 	readonly label: string
 	readonly description: string | undefined
+	readonly access: string | undefined
 	readonly node: Extract<ExprNode, { kind: 'aggregate' }>
 }
 
@@ -45,6 +57,7 @@ export type ShareMeasure = {
 	readonly result: 'ratio'
 	readonly label: string
 	readonly description: string | undefined
+	readonly access: string | undefined
 	readonly numerator: ExprNode
 	readonly denominator: ExprNode | null
 }
@@ -57,6 +70,8 @@ export type RatioMeasure<
 	readonly result: 'ratio'
 	readonly label: string
 	readonly description: string | undefined
+	/** A ratio also needs the access of the measures it divides. */
+	readonly access: string | undefined
 	readonly numerator: A
 	readonly denominator: B
 }
@@ -70,19 +85,22 @@ export type MeasureValue<M> = M extends { result: 'count' }
 		? number | null
 		: Ratio | null
 
-type Filtered = Described & { where?: Expr<'boolean'> | undefined }
+type Filtered<Access extends string> = Described<Access> & {
+	where?: Expr<'boolean'> | undefined
+}
 
-function aggregate<R extends 'count' | 'number'>(
+function aggregate<R extends 'count' | 'number', Access extends string>(
 	result: R,
 	fn: Extract<ExprNode, { kind: 'aggregate' }>['fn'],
 	arg: Expr<SqlType> | null,
-	options: Filtered
-): AggregateMeasure<R> {
+	options: Filtered<Access>
+): AggregateMeasure<R> & Marked<NoInfer<Access>> {
 	return {
 		kind: 'aggregate',
 		result,
 		label: options.label,
 		description: options.description,
+		access: options.access,
 		node: {
 			kind: 'aggregate',
 			fn,
@@ -94,35 +112,46 @@ function aggregate<R extends 'count' | 'number'>(
 
 export const measure = {
 	/** Number of rows, optionally only those matching `where`. */
-	count(options: Filtered): AggregateMeasure<'count'> {
+	count<Access extends string = never>(
+		options: Filtered<Access>
+	): AggregateMeasure<'count'> & Marked<NoInfer<Access>> {
 		return aggregate('count', 'count', null, options)
 	},
 
 	/** Number of rows matching `condition`. */
-	countWhere(
+	countWhere<Access extends string = never>(
 		condition: Expr<'boolean'>,
-		options: Described
-	): AggregateMeasure<'count'> {
+		options: Described<Access>
+	): AggregateMeasure<'count'> & Marked<NoInfer<Access>> {
 		return aggregate('count', 'count', null, { ...options, where: condition })
 	},
 
 	/** Number of distinct non-null values of `expr`. */
-	countDistinct(
+	countDistinct<Access extends string = never>(
 		expr: Expr<SqlType>,
-		options: Filtered
-	): AggregateMeasure<'count'> {
+		options: Filtered<Access>
+	): AggregateMeasure<'count'> & Marked<NoInfer<Access>> {
 		return aggregate('count', 'countDistinct', expr, options)
 	},
 
-	sum(expr: Expr<'number'>, options: Filtered): AggregateMeasure<'number'> {
+	sum<Access extends string = never>(
+		expr: Expr<'number'>,
+		options: Filtered<Access>
+	): AggregateMeasure<'number'> & Marked<NoInfer<Access>> {
 		return aggregate('number', 'sum', expr, options)
 	},
 
-	avg(expr: Expr<'number'>, options: Filtered): AggregateMeasure<'number'> {
+	avg<Access extends string = never>(
+		expr: Expr<'number'>,
+		options: Filtered<Access>
+	): AggregateMeasure<'number'> & Marked<NoInfer<Access>> {
 		return aggregate('number', 'avg', expr, options)
 	},
 
-	median(expr: Expr<'number'>, options: Filtered): AggregateMeasure<'number'> {
+	median<Access extends string = never>(
+		expr: Expr<'number'>,
+		options: Filtered<Access>
+	): AggregateMeasure<'number'> & Marked<NoInfer<Access>> {
 		return aggregate('number', 'median', expr, options)
 	},
 
@@ -130,17 +159,18 @@ export const measure = {
 	 * The share of rows matching `numerator` among rows matching `denominator` (all rows when
 	 * omitted). A `Ratio` from 0 to 1.
 	 */
-	share(
-		options: Described & {
+	share<Access extends string = never>(
+		options: Described<Access> & {
 			numerator: Expr<'boolean'>
 			denominator?: Expr<'boolean'> | undefined
 		}
-	): ShareMeasure {
+	): ShareMeasure & Marked<NoInfer<Access>> {
 		return {
 			kind: 'share',
 			result: 'ratio',
 			label: options.label,
 			description: options.description,
+			access: options.access,
 			numerator: options.numerator.node,
 			denominator: options.denominator?.node ?? null
 		}
@@ -150,16 +180,21 @@ export const measure = {
 	 * One measure of this dataset over another, computed after aggregation. Both keys must be
 	 * measures of the same dataset; `defineDataset` checks them.
 	 */
-	ratio<const A extends string, const B extends string>(
+	ratio<
+		const A extends string,
+		const B extends string,
+		Access extends string = never
+	>(
 		numerator: A,
 		denominator: B,
-		options: Described
-	): RatioMeasure<A, B> {
+		options: Described<Access>
+	): RatioMeasure<A, B> & Marked<NoInfer<Access>> {
 		return {
 			kind: 'ratio',
 			result: 'ratio',
 			label: options.label,
 			description: options.description,
+			access: options.access,
 			numerator,
 			denominator
 		}
@@ -181,8 +216,9 @@ export type DimensionCategory = 'closed' | 'open' | 'numeric' | 'time'
 
 type DimensionOptions<
 	G extends boolean = boolean,
-	F extends boolean = boolean
-> = Described & {
+	F extends boolean = boolean,
+	Access extends string = string
+> = Described<Access> & {
 	/** Only offered for grouping. */
 	groupOnly?: G | undefined
 	/** Only offered for filtering. */
@@ -190,19 +226,25 @@ type DimensionOptions<
 }
 
 /** Time dimensions name themselves after their unit unless given a label. */
-type TimeDimensionOptions<G extends boolean, F extends boolean, Key> = Omit<
-	DimensionOptions<G, F>,
-	'label'
-> & {
+type TimeDimensionOptions<
+	G extends boolean,
+	F extends boolean,
+	Key,
+	Access extends string
+> = Omit<DimensionOptions<G, F, Access>, 'label'> & {
 	label?: string | undefined
 	labelFor?: ((key: Key) => string) | undefined
 }
 
 /**
  * `groupOnly: true` makes `filterable` the literal `false` (and `filterOnly`, `groupable`), so
- * queries cannot filter or group by what the dimension does not offer.
+ * queries cannot filter or group by what the dimension does not offer. `access` stays literal.
  */
-export type DimensionAccess<G extends boolean, F extends boolean> = {
+export type DimensionAccess<
+	G extends boolean,
+	F extends boolean,
+	Access extends string = never
+> = Marked<Access> & {
 	readonly groupable: [F] extends [true] ? false : boolean
 	readonly filterable: [G] extends [true] ? false : boolean
 }
@@ -211,6 +253,7 @@ type DimensionBase<C extends DimensionCategory, Key> = {
 	readonly category: C
 	readonly label: string
 	readonly description: string | undefined
+	readonly access: string | undefined
 	readonly groupable: boolean
 	readonly filterable: boolean
 	/** Phantom: the key type in result rows. */
@@ -317,23 +360,32 @@ function base(options: DimensionOptions) {
 	return {
 		label: options.label,
 		description: options.description,
+		access: options.access,
 		groupable: options.filterOnly !== true,
 		filterable: options.groupOnly !== true
 	}
 }
 
-/** Narrows `groupable` and `filterable` (which `base` computed) to what the options say. */
+/**
+ * Narrows `groupable`, `filterable` and `access` (which `base` copied) to what the options
+ * say.
+ */
 function withAccess<
 	D extends AnyDimension,
 	G extends boolean,
-	F extends boolean
+	F extends boolean,
+	Access extends string
 >(
 	_options:
-		| { groupOnly?: G | undefined; filterOnly?: F | undefined }
+		| {
+				groupOnly?: G | undefined
+				filterOnly?: F | undefined
+				access?: Access | undefined
+		  }
 		| undefined,
 	dimension: D
-): D & DimensionAccess<G, F> {
-	return dimension as D & DimensionAccess<G, F>
+): D & DimensionAccess<G, F, NoInfer<Access>> {
+	return dimension as D & DimensionAccess<G, F, Access>
 }
 
 export const dimension = {
@@ -346,13 +398,15 @@ export const dimension = {
 		const E extends Record<string, string>,
 		V extends string | null,
 		G extends boolean = boolean,
-		F extends boolean = boolean
+		F extends boolean = boolean,
+		Access extends string = never
 	>(
 		expr: Expr<'string', V> & CoversValues<V, E[keyof E]>,
 		values: E,
-		options: DimensionOptions<G, F> &
+		options: DimensionOptions<G, F, Access> &
 			EmptyOption & { labels: Record<E[keyof E], string> }
-	): EnumDimension<E[keyof E], EmptyOf<V>> & DimensionAccess<G, F> {
+	): EnumDimension<E[keyof E], EmptyOf<V>> &
+		DimensionAccess<G, F, NoInfer<Access>> {
 		for (const value of Object.values(values)) {
 			if (!(value in options.labels)) {
 				throw new Error(`${options.label}: the value ${value} has no label`)
@@ -379,14 +433,15 @@ export const dimension = {
 		V extends string | null,
 		const K extends string,
 		G extends boolean = boolean,
-		F extends boolean = boolean
+		F extends boolean = boolean,
+		Access extends string = never
 	>(
-		options: DimensionOptions<G, F> &
+		options: DimensionOptions<G, F, Access> &
 			EmptyOption & {
 				expr: Expr<'string', V> & CoversValues<V, NoInfer<K>>
 				values: Record<K, string>
 			}
-	): EnumDimension<K, EmptyOf<V>> & DimensionAccess<G, F> {
+	): EnumDimension<K, EmptyOf<V>> & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
 			...base(options),
 			category: 'closed',
@@ -405,14 +460,15 @@ export const dimension = {
 	relation<
 		Key extends string | number,
 		G extends boolean = boolean,
-		F extends boolean = boolean
+		F extends boolean = boolean,
+		Access extends string = never
 	>(
-		options: DimensionOptions<G, F> & {
+		options: DimensionOptions<G, F, Access> & {
 			key: Expr<Key extends number ? 'number' : 'string', Key | null>
 			name: Expr<'string'>
 			empty?: string | undefined
 		}
-	): RelationDimension<Key> & DimensionAccess<G, F> {
+	): RelationDimension<Key> & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
 			...base(options),
 			category: 'open',
@@ -434,9 +490,10 @@ export const dimension = {
 	manyToMany<
 		Row = unknown,
 		G extends boolean = boolean,
-		F extends boolean = boolean
+		F extends boolean = boolean,
+		Access extends string = never
 	>(
-		options: DimensionOptions<G, F> & {
+		options: DimensionOptions<G, F, Access> & {
 			through: {
 				table: Table<Row>
 				on: Expr<'boolean'>
@@ -447,7 +504,7 @@ export const dimension = {
 			note?: string | undefined
 			empty?: string | undefined
 		}
-	): ManyToManyDimension & DimensionAccess<G, F> {
+	): ManyToManyDimension & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
 			...base(options),
 			category: 'open',
@@ -462,12 +519,16 @@ export const dimension = {
 	},
 
 	/** A numeric column, grouped by its exact values and filtered with `between`. */
-	number<G extends boolean = boolean, F extends boolean = boolean>(
+	number<
+		G extends boolean = boolean,
+		F extends boolean = boolean,
+		Access extends string = never
+	>(
 		expr: Expr<'number'>,
-		options: DimensionOptions<G, F> & {
+		options: DimensionOptions<G, F, Access> & {
 			labelFor?: ((key: number) => string) | undefined
 		}
-	): NumberDimension & DimensionAccess<G, F> {
+	): NumberDimension & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
 			...base(options),
 			category: 'numeric',
@@ -481,12 +542,13 @@ export const dimension = {
 	timeBucket<
 		const T extends string,
 		G extends boolean = boolean,
-		F extends boolean = boolean
+		F extends boolean = boolean,
+		Access extends string = never
 	>(
 		time: T,
 		unit: TimeBucketUnit,
-		options?: TimeDimensionOptions<G, F, string>
-	): TimeBucketDimension<T> & DimensionAccess<G, F> {
+		options?: TimeDimensionOptions<G, F, string, Access>
+	): TimeBucketDimension<T> & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
 			...base({
 				...options,
@@ -504,12 +566,13 @@ export const dimension = {
 	timePart<
 		const T extends string,
 		G extends boolean = boolean,
-		F extends boolean = boolean
+		F extends boolean = boolean,
+		Access extends string = never
 	>(
 		time: T,
 		part: TimePartName,
-		options?: TimeDimensionOptions<G, F, number>
-	): TimePartDimension<T> & DimensionAccess<G, F> {
+		options?: TimeDimensionOptions<G, F, number, Access>
+	): TimePartDimension<T> & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
 			...base({
 				...options,
@@ -541,7 +604,8 @@ export type Dataset<
 	readonly description: string
 	readonly from: TableRef
 	readonly source: string | undefined
-	readonly tenantColumn: ExprNode
+	/** Null for a dataset without tenants, which only `allTenants` may query. */
+	readonly tenantColumn: ExprNode | null
 	readonly scope: ExprNode | null
 	readonly time: Readonly<Record<T, TimeField>>
 	readonly defaultTime: T
@@ -585,8 +649,12 @@ export type DatasetDefinition<
 	from: { readonly ref: TableRef }
 	/** Which source (database) the dataset runs on; the default when there is one source. */
 	source?: string | undefined
-	/** The column every query is filtered by; the value comes from `tenant(ctx)`. */
-	tenantColumn: Expr<SqlType>
+	/**
+	 * The column every query is filtered by; the value comes from `tenant(ctx)`. `null` for a
+	 * dataset whose rows belong to no tenant (staff work, platform-wide records): only a caller
+	 * whose `tenant(ctx)` is `allTenants` may query it, and everyone else is refused.
+	 */
+	tenantColumn: Expr<SqlType> | null
 	/** Always applied, for example excluding test rows. */
 	scope?: Expr<'boolean'> | undefined
 	time: Record<T, { column: Expr<'timestamp'>; label: string }>
@@ -623,6 +691,13 @@ export function defineDataset<
 		)
 	}
 
+	// A JavaScript caller that leaves it out must not get a dataset without tenants.
+	if (definition.tenantColumn === undefined) {
+		throw new Error(
+			`Dataset ${definition.key}: declare tenantColumn, or null for a dataset without tenants`
+		)
+	}
+
 	const time = Object.fromEntries(
 		timeEntries.map(([key, field]) => [
 			key,
@@ -636,7 +711,7 @@ export function defineDataset<
 		description: definition.description,
 		from: definition.from.ref,
 		source: definition.source,
-		tenantColumn: definition.tenantColumn.node,
+		tenantColumn: definition.tenantColumn?.node ?? null,
 		scope: definition.scope?.node ?? null,
 		time,
 		defaultTime: definition.defaultTime ?? (firstTime[0] as T),
@@ -675,7 +750,7 @@ function validateDataset<DS extends AnyDataset>(dataset: DS): DS {
 		})
 	}
 
-	check(dataset.tenantColumn, 'tenantColumn')
+	if (dataset.tenantColumn) check(dataset.tenantColumn, 'tenantColumn')
 	if (dataset.scope) check(dataset.scope, 'scope')
 	for (const [key, field] of Object.entries<TimeField>(dataset.time)) {
 		check(field.column, `time field ${key}`)
