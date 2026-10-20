@@ -112,6 +112,8 @@ export type AnalyticsQueryEvent = {
 	/** Rows returned; 0 on error. */
 	rows: number
 	outcome: 'success' | 'error'
+	/** Whether `cache` answered the query; absent without a cache or when it never got that far. */
+	cache?: 'hit' | 'miss'
 	/** What the query threw, on error. */
 	error?: unknown
 }
@@ -172,6 +174,32 @@ export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	 * throws or rejects with is swallowed, so it can never fail a query.
 	 */
 	onQuery?: ((event: AnalyticsQueryEvent, ctx: Ctx) => unknown) | undefined
+	/**
+	 * Where finished results are kept and looked up. What it throws or rejects with is
+	 * swallowed: a failing cache is a miss, never a failed query.
+	 */
+	cache?: AnalyticsCache<Ctx, DS[number]['key']> | undefined
+}
+
+/**
+ * A store for finished results, such as Redis. Keys name the dataset and hash everything that
+ * decides the result: the query with its defaults, the tenant scope, the timezone and the
+ * resolved days. A query is parsed and authorized before the cache is asked, so a cached result
+ * never reaches a caller who may not run the query. Results are plain JSON.
+ */
+export type AnalyticsCache<Ctx, Key extends string = string> = {
+	/**
+	 * The stored result, or null/undefined for a miss. Return a miss to bypass the cache for a
+	 * caller (a refresh button); its fresh result is still stored. A stored value that is not a
+	 * result of this dataset counts as a miss, so a changed definition does not break queries.
+	 */
+	get(key: string, entry: { dataset: Key; ctx: Ctx }): unknown
+	/** Stores a result; pick the time to live per `dataset`. */
+	set(
+		key: string,
+		result: QueryResult<Row, Row>,
+		entry: { dataset: Key; ctx: Ctx }
+	): unknown
 }
 
 export type DatasetCatalogEntry<Key extends string = string> = {
@@ -179,7 +207,13 @@ export type DatasetCatalogEntry<Key extends string = string> = {
 	label: string
 	description: string
 	time: { key: string; label: string }[]
-	measures: { key: string; label: string; description: string | undefined }[]
+	measures: {
+		key: string
+		label: string
+		description: string | undefined
+		/** `count`: a whole number, never null. `ratio`: 0-1 (`share`, `ratio`). `number`: the rest. */
+		valueType: 'count' | 'number' | 'ratio'
+	}[]
 	dimensions: {
 		key: string
 		label: string
@@ -464,9 +498,8 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		return { dataset, query, tenant, timezone, period, previous, now: at }
 	}
 
-	const runQuery = async (input: unknown, ctx: Ctx): Promise<ShapedResult> => {
-		const { dataset, query, tenant, timezone, period, previous, now } =
-			await prepare(input, ctx)
+	const runQuery = async (prepared: Prepared): Promise<ShapedResult> => {
+		const { dataset, query, tenant, timezone, period, previous, now } = prepared
 		const source = sourceFor(dataset)
 		const { dialect } = source
 		const run = (statement: SelectStatement) =>
@@ -537,26 +570,71 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		}
 	}
 
+	/** The cached result, or null; a failing or malformed cache entry is a miss. */
+	const cachedResult = async (
+		key: string,
+		entry: { dataset: string; ctx: Ctx }
+	): Promise<ShapedResult | null> => {
+		try {
+			const value = await options.cache?.get(key, entry)
+			if (value === null || value === undefined) return null
+			const parsed = resultSchemaFor(entry.dataset).safeParse(value)
+			return parsed.success ? (parsed.data as ShapedResult) : null
+		} catch {
+			return null
+		}
+	}
+
+	const store = (
+		key: string,
+		result: ShapedResult,
+		entry: { dataset: string; ctx: Ctx }
+	) => {
+		try {
+			Promise.resolve(options.cache?.set(key, result, entry)).catch(() => {})
+		} catch {
+			// A cache that cannot store is a slower query, not a failed one.
+		}
+	}
+
 	const query = async (input: unknown, ctx: Ctx): Promise<ShapedResult> => {
 		const startedAt = performance.now()
 		const dataset = datasetKeyOf(input)
 		const durationMs = () => Math.round(performance.now() - startedAt)
+		let cache: AnalyticsQueryEvent['cache']
 
 		try {
-			const result = await runQuery(input, ctx)
+			const prepared = await prepare(input, ctx)
+			const entry = { dataset: prepared.dataset.key, ctx }
+			const key = options.cache && (await cacheKey(prepared))
+			let result = key ? await cachedResult(key, entry) : null
+			if (key) cache = result ? 'hit' : 'miss'
+			if (!result) {
+				result = await runQuery(prepared)
+				if (key) store(key, result, entry)
+			}
+
 			report(
 				{
 					dataset,
 					durationMs: durationMs(),
 					rows: result.rows.length,
-					outcome: 'success'
+					outcome: 'success',
+					...(cache && { cache })
 				},
 				ctx
 			)
 			return result
 		} catch (error) {
 			report(
-				{ dataset, durationMs: durationMs(), rows: 0, outcome: 'error', error },
+				{
+					dataset,
+					durationMs: durationMs(),
+					rows: 0,
+					outcome: 'error',
+					...(cache && { cache }),
+					error
+				},
 				ctx
 			)
 			throw error
@@ -606,6 +684,49 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 					catalogEntry(dataset) as DatasetCatalogEntry<DS[number]['key']>
 			)
 	}
+}
+
+/**
+ * The cache key of a prepared query: its dataset, then a SHA-256 of everything that decides
+ * the result. Resolved days are part of it, so `last 30 days` moves on at local midnight.
+ */
+async function cacheKey(prepared: Prepared): Promise<string> {
+	const { dataset, query, tenant, timezone, period, previous } = prepared
+	const days = (target: ResolvedPeriod | null) =>
+		target && [target.from, target.to]
+	const scope =
+		tenant === allTenants
+			? { all: true }
+			: Array.isArray(tenant)
+				? [...new Set(tenant.map((id) => JSON.stringify(id)))].sort()
+				: tenant
+	const text = stableJson({
+		query,
+		tenant: scope,
+		timezone,
+		period: days(period),
+		previous: days(previous)
+	})
+	const digest = await crypto.subtle.digest(
+		'SHA-256',
+		new TextEncoder().encode(text)
+	)
+	const hex = Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, '0')
+	).join('')
+
+	return `measurr:${dataset.key}:${hex}`
+}
+
+/** JSON with object keys sorted, so equal values give equal text. */
+function stableJson(value: unknown): string {
+	return JSON.stringify(value, (_key, inner: unknown) =>
+		inner && typeof inner === 'object' && !Array.isArray(inner)
+			? Object.fromEntries(
+					Object.entries(inner).sort(([a], [b]) => (a < b ? -1 : 1))
+				)
+			: inner
+	)
 }
 
 /**
@@ -846,14 +967,19 @@ function catalogEntry(dataset: AnyDataset): DatasetCatalogEntry {
 				label: field.label
 			})
 		),
-		measures: Object.entries<{
-			label: string
-			description: string | undefined
-		}>(dataset.measures).map(([key, entry]) => ({
-			key,
-			label: entry.label,
-			description: entry.description
-		})),
+		measures: Object.entries<AnyMeasure>(dataset.measures).map(
+			([key, entry]) => ({
+				key,
+				label: entry.label,
+				description: entry.description,
+				valueType:
+					entry.kind !== 'aggregate'
+						? 'ratio'
+						: entry.node.fn === 'count' || entry.node.fn === 'countDistinct'
+							? 'count'
+							: 'number'
+			})
+		),
 		dimensions: Object.entries<AnyDimension>(dataset.dimensions).map(
 			([key, entry]) => ({
 				key,

@@ -22,6 +22,7 @@ import {
 	orders,
 	sales
 } from './fixtures/orders.js'
+import { toTimeseries } from './shapes.js'
 import { assertDatasetContract } from './testing.js'
 
 const url = process.env.ANALYTICS_TEST_DATABASE_URL
@@ -180,6 +181,58 @@ describe.skipIf(!url)('postgres integration', () => {
 		expect(result.previous?.totals.orders).toBe(1)
 		// Counts and sums come back from Postgres as bigints and numerics.
 		expect(AnalyticsResultSchema.parse(result)).toEqual(result)
+	})
+
+	test('a weekly series keys buckets the way bucketStarts fills them', async () => {
+		const result = await analytics.query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['week'],
+				period: { from: '2026-09-14', to: '2026-10-07' }
+			},
+			tenantA
+		)
+
+		expect(
+			toTimeseries(result, { bucket: 'week', unit: 'week', measure: 'orders' })
+				.series[0]?.points
+		).toEqual([
+			{ bucket: '2026-09-14', value: 1 },
+			{ bucket: '2026-09-21', value: 0 },
+			{ bucket: '2026-09-28', value: 3 },
+			{ bucket: '2026-10-05', value: 0 }
+		])
+	})
+
+	test('a cached result is what the database returned', async () => {
+		const store = new Map<string, unknown>()
+		const cached = createAnalytics({
+			datasets: [orders],
+			sources: { main: source },
+			tenant: () => 'A',
+			now: () => NOW,
+			cache: {
+				// Through JSON, as Redis would store it.
+				get: (key) => {
+					const text = store.get(key)
+					return typeof text === 'string' ? JSON.parse(text) : undefined
+				},
+				set: (key, result) => store.set(key, JSON.stringify(result))
+			}
+		})
+		const query = {
+			dataset: 'orders',
+			measures: ['orders', 'revenue', 'paidShare'],
+			groupBy: ['status'],
+			compareToPrevious: true
+		} as const
+
+		const fresh = await cached.query(query, {})
+		const hit = await cached.query(query, {})
+
+		expect(store.size).toBe(1)
+		expect(hit).toEqual(fresh)
 	})
 
 	test('shares, ratios and correlated exists', async () => {

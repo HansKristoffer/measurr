@@ -1,6 +1,7 @@
 export {
 	type AccessKey,
 	type Analytics,
+	type AnalyticsCache,
 	AnalyticsError,
 	type AnalyticsErrorCode,
 	type AnalyticsErrorDetails,
