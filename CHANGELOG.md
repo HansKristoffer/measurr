@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/HansKristoffer/measurr/compare/v0.4.0...v0.5.0) (2026-10-20)
+
+
+### Features
+
+* result cache, chart shapes and batch handler ([8ba4735](https://github.com/HansKristoffer/measurr/commit/8ba4735ff44f8455f29fc384700ed1a1c40bb5ad))
+* result cache, chart shapes and batch handler for hellu metrics parity ([fb4982b](https://github.com/HansKristoffer/measurr/commit/fb4982bdf2d2750e9ce2e5b74323f653e7cd458e))
+
 ## [0.4.0](https://github.com/HansKristoffer/measurr/compare/v0.3.0...v0.4.0) (2026-10-10)
 
 
