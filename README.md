@@ -176,9 +176,95 @@ ${analyticsToolGuidance}`
 ```
 
 `onQuery(event, ctx)` hears every `query` once it succeeds or fails:
-`{ dataset, durationMs, rows, outcome: 'success' | 'error', error? }`. `dataset` is null when
-the input named no known dataset, so free text from a model never becomes a metric label.
-What the hook throws or rejects with is swallowed; it cannot fail a query.
+`{ dataset, durationMs, rows, outcome: 'success' | 'error', cache?, error? }`. `dataset` is null
+when the input named no known dataset, so free text from a model never becomes a metric label.
+`cache` is `'hit'` or `'miss'` when a cache is configured. What the hook throws or rejects with is
+swallowed; it cannot fail a query.
+
+Each measure in `listDatasets` has a `valueType`: `count` (a whole number, never null),
+`ratio` (0-1, from `share` and `ratio`) or `number` (sums, averages, medians), so a UI knows
+to format a share as a percentage.
+
+## Caching
+
+`cache: { get, set }` keeps finished results in a store of your choice, such as Redis. A query
+is parsed and authorized first, so a cached result never reaches a caller who may not run the
+query. The key is `measurr:<dataset>:<sha256>`, hashed from the query with its defaults, the
+tenant scope, the timezone and the resolved days (so `last 30 days` moves on at local midnight).
+Results are plain JSON.
+
+```ts
+const TTL_SECONDS: Record<AnalyticsDatasetKey, number> = { orders: 300, units: 60 }
+
+createAnalytics({
+	// ...
+	cache: {
+		// A miss bypasses the cache; the fresh result is still stored.
+		get: async (key, { ctx }) =>
+			ctx.refresh ? null : JSON.parse((await redis.get(`${BUILD_ID}:${key}`)) ?? 'null'),
+		set: (key, result, { dataset }) =>
+			redis.setex(`${BUILD_ID}:${key}`, TTL_SECONDS[dataset], JSON.stringify(result))
+	}
+})
+```
+
+A stored value that is not a result of its dataset counts as a miss, and a cache that throws or
+rejects is a miss or a skipped write, never a failed query. A changed measure keeps its key, so
+prefix keys with a build id (as above) if old numbers must not outlive a deploy. A dataset that
+uses `minutesAgo` is as stale as the time to live.
+
+## Chart shapes
+
+`measurr/shapes` turns a result into what a chart or a KPI card draws. The functions are pure
+and add no numbers the result does not hold; with `compareToPrevious` they carry the previous
+period too.
+
+```ts
+import { toDistribution, toKpi, toPivot, toTimeseries, toLeaderboard } from 'measurr/shapes'
+
+toKpi(result, 'orders')
+// { kind: 'kpi', value: 12, previous: 8, change: 0.5 }
+
+toTimeseries(result, { bucket: 'day', unit: 'day', measure: 'orders', series: 'status' })
+// { kind: 'timeseries', unit, series: [{ key, label, points: [{ bucket: '2026-10-01', value }], previous? }] }
+
+toDistribution(result, { by: 'status', measure: 'orders' }) // segments with share of the total
+toPivot(result, { rows: 'weekday', columns: 'hour', measure: 'orders' }) // values[row][column]
+toLeaderboard(result, { by: 'region', measure: 'revenue' }) // ranked rows with every measure
+```
+
+- `toTimeseries` gives every bucket of the period a point; buckets without rows get `fill` (0 by
+  default, pass `null` for averages). An all-time result has only the buckets it found. The
+  previous period's points are on its own buckets; compare them by position.
+- A grouped query returns at most `limit` rows (20 by default, 100 at most), and the shape keeps
+  `truncated`. Set `limit: 100` for a series; 30 days split into three series fit, 90 days into
+  eleven do not.
+- `toDistribution`'s `total` is the measure over every row, so many-to-many shares can add up to
+  more than 1. `toPivot` sorts numeric keys (weekdays, hours).
+
+## Serving queries
+
+`measurr/handler` serves queries from any server framework:
+
+- `queryBatch(analytics, { total: q1, byStatus: q2 }, ctx)` runs named queries in parallel and
+  resolves to `{ results, errors }`, typed per name. One failing query does not fail the
+  others; an error other than `AnalyticsError` is reported as `{ code: 'internal' }` without
+  its message.
+- `streamBatch(analytics, queries, ctx)` yields `{ key, result }` or `{ key, error }` as each
+  query finishes, for a streaming endpoint.
+- `toHttpError(error)` maps an `AnalyticsError` to `{ status, code, message, data? }`:
+  `forbidden` is 403 `FORBIDDEN`, `missing_tenant` 401 `UNAUTHORIZED`, the rest 400
+  `BAD_REQUEST` with the code and details. The codes are the names oRPC and tRPC use:
+
+```ts
+try {
+	return await analytics.query(input, ctx)
+} catch (error) {
+	if (!(error instanceof AnalyticsError)) throw error
+	const { code, message, data } = toHttpError(error)
+	throw new ORPCError(code, { message, data })
+}
+```
 
 ## Tenants and platform admins
 
@@ -420,16 +506,18 @@ await assertDatasetContract({ dataset: maintenance, source, tenant: allTenants }
 
 ## Stable API
 
-Kept stable for publishing: `createAnalytics` and its options (with `authorize` and
-`authorizeField`), `allTenants`, `analytics.query`, `explain`, `querySchema`, `resultSchema`,
-`listDatasets`; `AnalyticsResultSchema`, `analyticsToolGuidance`, `AnalyticsQueryEvent`;
-`defineDataset` (with `defaultPeriod` and `tenantColumn: null`), `measure.*` and `dimension.*`
-(with `access`), `table` / `Table`, the expression builders; the `Dialect`,
-`SqlRenderer` and `AnalyticsSource` contracts; `postgresDialect`, `checkDatasetContract` /
-`assertDatasetContract`; and the types `AnalyticsQuery`, `AnalyticsResult`, `ResultPeriod`,
-`PeriodInput`, `Tenant`, `TenantId`, `AccessKey`, `FieldKey`, `Ratio`, `AnalyticsError` codes
-and their details (`isAnalyticsError`). `ExprNode` and `SelectStatement` are exported for
-dialect authors and may grow new node kinds.
+Kept stable for publishing: `createAnalytics` and its options (with `authorize`,
+`authorizeField` and `cache`), `allTenants`, `analytics.query`, `explain`, `querySchema`,
+`resultSchema`, `listDatasets`; `AnalyticsResultSchema`, `analyticsToolGuidance`,
+`AnalyticsQueryEvent`; `defineDataset` (with `defaultPeriod` and `tenantColumn: null`),
+`measure.*` and `dimension.*` (with `access`), `table` / `Table`, the expression builders; the
+`Dialect`, `SqlRenderer` and `AnalyticsSource` contracts; `postgresDialect`,
+`checkDatasetContract` / `assertDatasetContract`; `measurr/shapes` (`toKpi`, `toTimeseries`,
+`toDistribution`, `toPivot`, `toLeaderboard`) and `measurr/handler` (`queryBatch`,
+`streamBatch`, `toHttpError`); and the types `AnalyticsQuery`, `AnalyticsResult`,
+`ResultPeriod`, `PeriodInput`, `Tenant`, `TenantId`, `AccessKey`, `AnalyticsCache`, `FieldKey`,
+`Ratio`, `AnalyticsError` codes and their details (`isAnalyticsError`). `ExprNode` and
+`SelectStatement` are exported for dialect authors and may grow new node kinds.
 
 ## Install
 

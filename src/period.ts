@@ -216,3 +216,35 @@ export function previousPeriod(period: ResolvedPeriod): ResolvedPeriod {
 
 	return periodFromDays(from, to, period.timezone)
 }
+
+/**
+ * The start date of every `unit` bucket that overlaps the days `from` to `to` (inclusive), as
+ * the time-bucket dimensions key them: the day, the ISO week's Monday, the month's first day.
+ */
+export function bucketStarts(
+	from: string,
+	to: string,
+	unit: 'day' | 'week' | 'month'
+): string[] {
+	let start =
+		unit === 'day'
+			? from
+			: unit === 'week'
+				? addDays(from, -(isoWeekday(from) - 1))
+				: `${from.slice(0, 8)}01`
+	const starts: string[] = []
+
+	while (start <= to) {
+		starts.push(start)
+		start =
+			unit === 'day'
+				? addDays(start, 1)
+				: unit === 'week'
+					? addDays(start, 7)
+					: formatDate(
+							Date.UTC(Number(start.slice(0, 4)), Number(start.slice(5, 7)), 1)
+						)
+	}
+
+	return starts
+}

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+	type AnalyticsCache,
 	type AnalyticsQueryEvent,
 	AnalyticsResultSchema,
 	allTenants,
@@ -429,5 +430,149 @@ describe('AnalyticsResultSchema', () => {
 				truncated: false
 			}).success
 		).toBe(false)
+	})
+})
+
+describe('cache', () => {
+	type CacheCtx = Ctx & { refresh?: boolean }
+
+	function cachedAnalytics(cache: Partial<AnalyticsCache<CacheCtx>> = {}) {
+		const store = new Map<string, unknown>()
+		const statements: string[] = []
+		const events: AnalyticsQueryEvent[] = []
+		const analytics = createAnalytics({
+			datasets: [orders, refunds],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text }) => {
+						statements.push(text)
+						return [{ m_orders: 3 }]
+					}
+				}
+			},
+			tenant: (ctx: CacheCtx) => ctx.tenantId,
+			authorize: (dataset, ctx) =>
+				dataset.key !== 'refunds' || ctx.canSeeRefunds,
+			now: () => new Date('2026-10-20T12:00:00Z'),
+			onQuery: (event) => events.push(event),
+			cache: {
+				get: (key, { ctx }) => (ctx.refresh ? undefined : store.get(key)),
+				set: (key, result) => store.set(key, result),
+				...cache
+			}
+		})
+		return { analytics, store, statements, events }
+	}
+
+	const ordersQuery = { dataset: 'orders', measures: ['orders'] } as const
+
+	test('answers a repeated query from the cache', async () => {
+		const { analytics, statements, events } = cachedAnalytics()
+
+		const first = await analytics.query(ordersQuery, ctx)
+		const second = await analytics.query(ordersQuery, ctx)
+
+		expect(second).toEqual(first)
+		expect(statements).toHaveLength(1)
+		expect(events.map((event) => event.cache)).toEqual(['miss', 'hit'])
+	})
+
+	test('keys name the dataset and ignore how the query is written', async () => {
+		const { analytics, store } = cachedAnalytics()
+
+		await analytics.query(
+			{
+				measures: ['orders'],
+				dataset: 'orders',
+				period: { last: { days: 30 } }
+			},
+			ctx
+		)
+		await analytics.query(ordersQuery, ctx)
+
+		expect([...store.keys()]).toEqual([
+			expect.stringMatching(/^measurr:orders:[0-9a-f]{64}$/)
+		])
+	})
+
+	test('a tenant, a period or a timezone of its own is a different entry', async () => {
+		const { analytics, store } = cachedAnalytics()
+
+		await analytics.query(ordersQuery, ctx)
+		await analytics.query(ordersQuery, { ...ctx, tenantId: 't2' })
+		await analytics.query(
+			{ ...ordersQuery, period: { last: { days: 7 } } },
+			ctx
+		)
+
+		expect(store.size).toBe(3)
+	})
+
+	test('a query the caller may not run never reaches the cache', async () => {
+		const { analytics, store } = cachedAnalytics()
+		const refundsQuery = { dataset: 'refunds', measures: ['refunds'] } as const
+		await analytics.query(refundsQuery, { ...ctx, canSeeRefunds: true })
+		expect(store.size).toBe(1)
+
+		await expect(analytics.query(refundsQuery, ctx)).rejects.toMatchObject({
+			code: 'forbidden'
+		})
+	})
+
+	test('a miss from get bypasses the cache and stores the fresh result', async () => {
+		const { analytics, statements, store } = cachedAnalytics()
+
+		await analytics.query(ordersQuery, ctx)
+		await analytics.query(ordersQuery, { ...ctx, refresh: true })
+
+		expect(statements).toHaveLength(2)
+		expect(store.size).toBe(1)
+	})
+
+	test('a stored value that is not a result is a miss', async () => {
+		const { analytics, statements } = cachedAnalytics({
+			get: () => ({ rows: 'stale' })
+		})
+
+		const result = await analytics.query(ordersQuery, ctx)
+
+		expect(result.totals.orders).toBe(3)
+		expect(statements).toHaveLength(1)
+	})
+
+	test('a failing cache never fails the query', async () => {
+		const { analytics } = cachedAnalytics({
+			get: async () => {
+				throw new Error('redis is down')
+			},
+			set: () => {
+				throw new Error('redis is down')
+			}
+		})
+
+		const result = await analytics.query(ordersQuery, ctx)
+
+		expect(result.totals.orders).toBe(3)
+	})
+})
+
+test('listDatasets says what values each measure gives', async () => {
+	const [entry] = await analyticsWith({}).listDatasets(ctx)
+
+	expect(
+		Object.fromEntries(
+			(entry?.measures ?? []).map((measure) => [measure.key, measure.valueType])
+		)
+	).toEqual({
+		orders: 'count',
+		customers: 'count',
+		refunded: 'count',
+		revenue: 'number',
+		averageAmount: 'number',
+		medianAmount: 'number',
+		averageRating: 'number',
+		paidShare: 'ratio',
+		refundRate: 'ratio'
 	})
 })
