@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/HansKristoffer/measurr/compare/v0.6.0...v0.7.0) (2026-10-21)
+
+
+### Features
+
+* ClickHouse dialect and resolved measures ([#11](https://github.com/HansKristoffer/measurr/issues/11)) ([d9e06ca](https://github.com/HansKristoffer/measurr/commit/d9e06ca2145fe413ed162dd043dc9815a31a0ca1))
+
 ## [0.6.0](https://github.com/HansKristoffer/measurr/compare/v0.5.0...v0.6.0) (2026-10-21)
 
 
