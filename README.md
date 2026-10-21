@@ -323,6 +323,9 @@ for await (const chunk of metrics.run(input, ctx)) send(chunk)
 - A metric that `canRun` refuses (`'Access denied'`), whose filters do not parse with its
   `filterSchema` (`'Invalid filters: ...'`), whose query fails (the engine's message) or whose
   `shape` throws (`'The metric could not be drawn'`) fails alone. `done` marks the last chunk.
+- `metricDefiner<Datasets, Role, Extra>()` takes the app's own definition fields as `Extra`
+  (catalog metadata, UI hints for filters); the registry carries them to `canRun` and
+  `available` without reading them.
 - Keys and outputs stay literal: a chunk narrows to its metric by `key`, and
   `MetricOutputOf<typeof metrics, 'orders.trend'>`, `MetricFiltersOf`, `MetricKeysOfKind` and
   `registry.get(key)` are typed per metric. `registry.available(ctx)` lists what `canRun`

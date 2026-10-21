@@ -59,7 +59,9 @@ export type MetricDefinition<
 
 /**
  * `defineMetric` for metrics over the datasets `DS` (a union), with `allowedRoles` typed as
- * `Role`. Types only, so metric modules need not import the analytics instance:
+ * `Role` and the app's own fields `Extra` (catalog metadata, say), which the registry carries
+ * along but does not read. Types only, so metric modules need not import the analytics
+ * instance:
  *
  * ```ts
  * export const defineMetric = metricDefiner<(typeof datasets)[number], Role>()
@@ -67,7 +69,8 @@ export type MetricDefinition<
  */
 export function metricDefiner<
 	DS extends AnyDataset,
-	Role extends string = string
+	Role extends string = string,
+	Extra extends object = Record<never, never>
 >() {
 	return <
 		const Key extends string,
@@ -76,7 +79,8 @@ export function metricDefiner<
 		const Q extends DatasetQuery<DS>,
 		Output extends OutputForKind<Kind>
 	>(
-		definition: MetricDefinition<DS, Key, Kind, Filters, Q, Output, Role>
+		definition: MetricDefinition<DS, Key, Kind, Filters, Q, Output, Role> &
+			Extra
 	) => definition
 }
 

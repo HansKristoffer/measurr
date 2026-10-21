@@ -391,6 +391,28 @@ describe('registry types', () => {
 		>()
 	})
 
+	test('an app adds its own fields', () => {
+		const defineMetric = metricDefiner<
+			typeof orders,
+			Role,
+			{ catalog?: { owner: string } }
+		>()
+		const metric = defineMetric({
+			key: 'orders.owned',
+			kind: 'kpi',
+			description: '',
+			supportsTimeRange: true,
+			filterSchema: z.object({}),
+			catalog: { owner: 'sales' },
+			query: () => ({ dataset: 'orders', measures: ['orders'] }),
+			shape: (result) => ({ kind: 'kpi', value: result.totals.orders })
+		})
+		expectTypeOf(metric.key).toEqualTypeOf<'orders.owned'>()
+		expectTypeOf(metric.catalog).toEqualTypeOf<{ owner: string } | undefined>()
+		// @ts-expect-error not a field of the definitions
+		defineMetric({ ...metric, unknownField: true })
+	})
+
 	test('a query and a shape are checked against the dataset', () => {
 		const defineMetric = metricDefiner<typeof orders, Role>()
 		defineMetric({
