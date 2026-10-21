@@ -22,6 +22,7 @@
 		"analytics",
 		"sql",
 		"postgres",
+		"clickhouse",
 		"zod",
 		"llm-tools"
 	],
@@ -44,6 +45,12 @@
 			"bun": "./src/dialects/postgres.ts",
 			"import": "./dist/dialects/postgres.js",
 			"default": "./dist/dialects/postgres.js"
+		},
+		"./clickhouse": {
+			"types": "./dist/dialects/clickhouse.d.ts",
+			"bun": "./src/dialects/clickhouse.ts",
+			"import": "./dist/dialects/clickhouse.js",
+			"default": "./dist/dialects/clickhouse.js"
 		},
 		"./shapes": {
 			"types": "./dist/shapes.d.ts",
@@ -72,7 +79,7 @@
 	},
 	"scripts": {
 		"build": "rm -rf dist && bun run build:js && bun run build:types",
-		"build:js": "bun build ./src/index.ts ./src/dialects/postgres.ts ./src/shapes.ts ./src/handler.ts ./src/metrics.ts ./src/testing.ts --root ./src --outdir ./dist --target node --packages external --splitting",
+		"build:js": "bun build ./src/index.ts ./src/dialects/postgres.ts ./src/dialects/clickhouse.ts ./src/shapes.ts ./src/handler.ts ./src/metrics.ts ./src/testing.ts --root ./src --outdir ./dist --target node --packages external --splitting",
 		"build:types": "tsgo -p tsconfig.build.json",
 		"prepublishOnly": "bun run build",
 		"test": "bun test",

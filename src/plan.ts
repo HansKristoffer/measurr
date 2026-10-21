@@ -150,7 +150,32 @@ function measureNode(dataset: AnyDataset, key: string): ExprNode {
 				left: measureNode(dataset, entry.numerator),
 				right: measureNode(dataset, entry.denominator)
 			}
+		case 'resolved':
+			throw new Error(
+				`Dataset ${dataset.key}: measure ${key} is resolved by the app, not the database`
+			)
 	}
+}
+
+/**
+ * The measures the database computes for `keys`: a resolved measure brings the measures it
+ * uses instead of itself.
+ */
+export function sqlMeasures(
+	dataset: AnyDataset,
+	keys: readonly string[]
+): string[] {
+	const result = new Set<string>()
+	for (const key of keys) {
+		const entry = measureOf(dataset, key)
+		if (entry.kind === 'resolved') {
+			for (const used of entry.uses) result.add(used)
+		} else {
+			result.add(key)
+		}
+	}
+
+	return [...result]
 }
 
 type DimensionNodes = {
@@ -364,10 +389,18 @@ export function planQuery(
 			select.push({ alias: columnAlias.groupLabel(key), node: nodes.label })
 		}
 	}
-	for (const key of query.measures) {
+	const measureKeys = sqlMeasures(dataset, query.measures)
+	for (const key of measureKeys) {
 		select.push({
 			alias: columnAlias.measure(key),
 			node: measureNode(dataset, key)
+		})
+	}
+	// Only resolved measures that use nothing: the statement still returns the groups.
+	if (select.length === 0) {
+		select.push({
+			alias: 'row_count',
+			node: { kind: 'aggregate', fn: 'count', arg: null, where: null }
 		})
 	}
 
@@ -413,7 +446,10 @@ function orderBy(
 		query.sort ??
 		(timeKey
 			? { by: timeKey, direction: 'asc' as const }
-			: { by: query.measures[0] ?? '', direction: 'desc' as const })
+			: {
+					by: sqlMeasures(dataset, query.measures)[0] ?? '',
+					direction: 'desc' as const
+				})
 
 	const sortIndex =
 		sort.by in dataset.measures
@@ -552,7 +588,7 @@ function labelOf(
 	}
 }
 
-/** Decodes measures in one raw row; counts are never null. */
+/** Decodes measures in one raw row; counts are never null. Resolved measures are left out. */
 export function shapeMeasures(
 	dataset: AnyDataset,
 	measures: readonly string[],
@@ -561,9 +597,10 @@ export function shapeMeasures(
 ): Record<string, number | null> {
 	const values: Record<string, number | null> = {}
 	for (const key of measures) {
+		const entry = measureOf(dataset, key)
+		if (entry.kind === 'resolved') continue
 		const value = dialect.decodeNumber(raw[columnAlias.measure(key)])
-		values[key] =
-			measureOf(dataset, key).result === 'count' ? (value ?? 0) : value
+		values[key] = entry.result === 'count' ? (value ?? 0) : value
 	}
 
 	return values
@@ -574,7 +611,11 @@ export function shapeRows(
 	query: NormalizedQuery,
 	rawRows: readonly Record<string, unknown>[],
 	dialect: Dialect
-): { rows: ShapedRow[]; truncated: boolean } {
+): {
+	rows: ShapedRow[]
+	kept: readonly Record<string, unknown>[]
+	truncated: boolean
+} {
 	const truncated = query.groupBy.length > 0 && rawRows.length > query.limit
 	const kept = truncated ? rawRows.slice(0, query.limit) : rawRows
 
@@ -596,7 +637,7 @@ export function shapeRows(
 		return { ...row, ...shapeMeasures(dataset, query.measures, raw, dialect) }
 	})
 
-	return { rows, truncated }
+	return { rows, kept, truncated }
 }
 
 /** Notes a reader needs to read the numbers right. */

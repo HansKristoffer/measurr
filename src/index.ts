@@ -9,12 +9,17 @@ export {
 	type AnalyticsOptions,
 	type AnalyticsQuery,
 	type AnalyticsQueryEvent,
+	type AnalyticsResolvers,
 	type AnalyticsResult,
 	type AnalyticsSource,
 	createAnalytics,
 	type DatasetCatalogEntry,
 	type FieldKey,
-	isAnalyticsError
+	isAnalyticsError,
+	type MeasureResolver,
+	type ResolvedKey,
+	type ResolverInput,
+	type ResolverOutput
 } from './analytics.js'
 export {
 	CompileError,
@@ -37,7 +42,8 @@ export {
 	dimension,
 	type MeasureValue,
 	measure,
-	type Ratio
+	type Ratio,
+	type ResolvedMeasure
 } from './dataset.js'
 export {
 	and,
@@ -68,7 +74,12 @@ export {
 } from './expr.js'
 export { analyticsToolGuidance } from './guidance.js'
 export type { PeriodInput, PeriodPreset } from './period.js'
-export { allTenants, type Tenant, type TenantId } from './plan.js'
+export {
+	allTenants,
+	type NormalizedFilter,
+	type Tenant,
+	type TenantId
+} from './plan.js'
 export {
 	AnalyticsResultSchema,
 	type DatasetFilter,

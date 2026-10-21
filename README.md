@@ -7,8 +7,8 @@ returns shaped, typed rows.
 
 - No SQL text in definitions: datasets are built from typed expression builders, so a
   renamed column, `avg` over a string or `between` on an enum fails typecheck.
-- Database-neutral definitions: dialects plug in through the `Dialect` interface, and Postgres
-  ships today (`measurr/postgres`).
+- Database-neutral definitions: dialects plug in through the `Dialect` interface. Postgres
+  (`measurr/postgres`) and ClickHouse (`measurr/clickhouse`) ship today.
 - Tenant-scoped by construction: the engine adds the tenant filter to every statement and
   refuses to run without a tenant. A caller can be scoped to one tenant or a list of them;
   platform admins can query every tenant only through an explicit `allTenants` value that no
@@ -355,6 +355,52 @@ try {
 }
 ```
 
+## Resolved measures
+
+Some numbers one statement cannot give: sprays per employee when the employees live in another
+database, an average per day of the period, a forecast. Declare such a measure with
+`measure.resolved` and give the code to `createAnalytics`. It stays a measure like any other:
+it is in the catalog and the schema, checked for access, scoped to the tenant and cached.
+
+```ts
+const sprays = defineDataset({
+	// ...
+	measures: {
+		sprays: measure.sum(status.col('sprays'), { label: 'Sprays' }),
+		spraysPerDay: measure.resolved({ label: 'Sprays per day', result: 'number', uses: ['sprays'] })
+	}
+})
+
+createAnalytics({
+	// ...
+	resolvers: {
+		sprays: {
+			spraysPerDay: ({ rows, totals, period }) => {
+				const days = 'all' in period ? null : daysBetween(period.from, period.to)
+				const perDay = (value: number | null) =>
+					value === null || days === null ? null : value / days
+				return { rows: rows.map(({ values }) => perDay(values.sprays)), totals: perDay(totals.sprays) }
+			}
+		}
+	}
+})
+```
+
+- `uses` names the measures of the same dataset the resolver reads. The database computes them
+  for every row and for the totals, even when the query does not ask for them, and the result
+  holds only what it asked for. A measure with no `uses` still gets one value per group.
+- The resolver gets the rows in order (`dimensions` for the grouped keys, `values` for the used
+  measures), the `totals`, `groupBy`, the `filters` (open-dimension labels resolved to keys),
+  the `period`, the `tenant` scope and `ctx`. It returns one value per row and one for the
+  totals. With `compareToPrevious` it is called once per period.
+- `createAnalytics` throws when a resolved measure has no resolver, and when `resolvers` names
+  anything else. A wrong number of values fails the query; a value that is not a finite number
+  is null, and a `count` result is 0 instead.
+- A resolved measure needs the access of the measures it uses, like a ratio. It cannot be sorted
+  by (the database limits the rows before the value exists), and `ratio` and `uses` cannot name
+  one.
+- The contract kit leaves resolved measures out: they are app code, so test them with it.
+
 ## Tenants and platform admins
 
 `tenant(ctx)` decides the scope of every statement, including the lookups that resolve filter
@@ -424,7 +470,7 @@ before any statement runs; a narrower scope is never ignored. `listDatasets(ctx)
 | Concept | What it is |
 | --- | --- |
 | Dataset | One fact table: tenant column (or `null`), optional scope, time fields, default period, measures, dimensions, source. |
-| Measure | `count`, `countWhere`, `countDistinct`, `sum`, `avg`, `median`, `share` (one condition over another) or `ratio` (one measure over another, after aggregation). Optionally restricted with `access`. |
+| Measure | `count`, `countWhere`, `countDistinct`, `sum`, `avg`, `median`, `share` (one condition over another), `ratio` (one measure over another, after aggregation) or `resolved` (computed by the app after the query runs). Optionally restricted with `access`. |
 | Dimension | `enum`, `computed` (closed value sets), `relation` (to-one), `manyToMany`, `number`, `timeBucket` (day, ISO week, month), `timePart` (ISO weekday, hour). Optionally restricted with `access`. |
 | Query | `dataset`, 1-4 `measures`, 0-2 `groupBy`, `filters`, `period`, `time`, `compareToPrevious`, `sort` (by an asked measure or grouped dimension), `limit` (1-100, default 20). |
 | Result | `{ period, rows, totals, previous?, notes, truncated }`; `period` is `{ from, to, timezone }` or `{ all: true, timezone }`. |
@@ -546,6 +592,34 @@ const main: AnalyticsSource = {
 }
 ```
 
+**`measurr/clickhouse`** `clickhouseDialect()`: typed `{pN:Type}` parameters, backquoted
+identifiers, `-If` and `-OrNull` aggregates (an empty group is null, as in Postgres), an exact
+interpolated median, `uniqExact` for distinct counts, and buckets with `toTimeZone`. Every
+statement ends with `SETTINGS join_use_nulls = 1, enable_positional_arguments = 1`, so a left
+join without a match gives null (an empty group) instead of an empty string. Pass the values
+with `toQueryParams`:
+
+```ts
+import { clickhouseDialect, toQueryParams } from 'measurr/clickhouse'
+
+const events: AnalyticsSource = {
+	dialect: clickhouseDialect(),
+	execute: async (statement) => {
+		const result = await clickhouse.query({
+			query: statement.text,
+			query_params: toQueryParams(statement),
+			format: 'JSONEachRow'
+		})
+		return result.json()
+	}
+}
+```
+
+ClickHouse cannot run correlated subqueries, so a dataset on it cannot use `exists` or filter
+by a many-to-many dimension (mark it `groupOnly`); `createAnalytics` fails at startup if it
+does. Time columns are `DateTime` or `DateTime64`, which hold instants. Tested against
+ClickHouse 24.
+
 **`measurr/postgres`** `postgresDialect({ timestamps })`: `$n` parameters (untyped,
 so Postgres infers them from the column, which keeps enum columns working), double-quoted
 identifiers, `FILTER (WHERE ...)`, `count(DISTINCT ...)`, `percentile_cont`, correlated
@@ -600,7 +674,9 @@ Kept stable for publishing: `createAnalytics` and its options (with `authorize`,
 `resultSchema`, `listDatasets`; `AnalyticsResultSchema`, `analyticsToolGuidance`,
 `AnalyticsQueryEvent`; `defineDataset` (with `defaultPeriod` and `tenantColumn: null`),
 `measure.*` and `dimension.*` (with `access`), `table` / `Table`, the expression builders; the
-`Dialect`, `SqlRenderer` and `AnalyticsSource` contracts; `postgresDialect`,
+`Dialect`, `SqlRenderer` and `AnalyticsSource` contracts; `measure.resolved` with the
+`resolvers` option (`MeasureResolver`, `ResolverInput`, `ResolverOutput`); `postgresDialect`,
+`clickhouseDialect` and `toQueryParams`,
 `checkDatasetContract` / `assertDatasetContract`; `measurr/shapes` (`toKpi`, `toTimeseries`,
 `toDistribution`, `toPivot`, `toLeaderboard`) and `measurr/handler` (`queryBatch`,
 `streamBatch`, `toHttpError`); and the types `AnalyticsQuery`, `AnalyticsResult`,
@@ -624,13 +700,14 @@ npm install measurr zod
 bun install
 bun run lint   # types and Biome
 bun test
-# With a throwaway Postgres (the integration test creates and drops its own tables):
-ANALYTICS_TEST_DATABASE_URL=postgres://... bun test
+# With a throwaway Postgres and ClickHouse (the integration tests create and drop their own tables):
+ANALYTICS_TEST_DATABASE_URL=postgres://... ANALYTICS_TEST_CLICKHOUSE_URL=http://user:password@localhost:8123 bun test
 bun run build && bun run verify:package
 ```
 
 The integration test reads `ANALYTICS_TEST_DATABASE_URL`, not `DATABASE_URL`, because Bun
-loads `.env` files and that name may point at a real database. CI runs it against Postgres 17.
+loads `.env` files and that name may point at a real database. CI runs them against Postgres 17
+and ClickHouse 24.
 
 Releases are automated with Release Please; see [docs/releasing.md](docs/releasing.md).
 

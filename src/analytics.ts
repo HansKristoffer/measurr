@@ -4,9 +4,13 @@ import type {
 	AnyDataset,
 	AnyDimension,
 	AnyMeasure,
-	Dataset
+	Dataset,
+	DimensionValue,
+	MeasureValue,
+	ResolvedMeasure
 } from './dataset.js'
 import {
+	type NormalizedFilter,
 	type NormalizedQuery,
 	type ParsedQuery,
 	type PlanContext,
@@ -31,6 +35,7 @@ import {
 	type DatasetQuery,
 	type QueryResult,
 	type ResultOf,
+	type ResultPeriod,
 	buildQuerySchema,
 	datasetResultSchema
 } from './query.js'
@@ -128,6 +133,65 @@ export type AccessKey<D> =
 		? NonNullable<(M & Dm)[keyof (M & Dm)]['access']>
 		: never
 
+/** The resolved measures of a dataset. */
+export type ResolvedKey<D> =
+	D extends Dataset<string, infer M>
+		? {
+				[K in keyof M & string]: M[K] extends { kind: 'resolved' } ? K : never
+			}[keyof M & string]
+		: never
+
+/** The values of the measures resolved measure `K` uses. */
+type UsedValues<D, K> =
+	D extends Dataset<string, infer M>
+		? M[K & keyof M] extends ResolvedMeasure<MeasureResult, infer U>
+			? { [Used in U & keyof M]: MeasureValue<M[Used]> }
+			: never
+		: never
+
+type MeasureResult = ResolvedMeasure['result']
+
+/** What a resolver gets for one period of one query. */
+export type ResolverInput<D, K, Ctx> =
+	D extends Dataset<string, infer _M, infer Dm>
+		? {
+				/**
+				 * The result rows in order: their grouped dimensions and the measures `K` uses. One
+				 * row when the query has no `groupBy`.
+				 */
+				rows: readonly {
+					dimensions: { [G in keyof Dm]?: DimensionValue<Dm[G]> }
+					values: UsedValues<D, K>
+				}[]
+				/** The used measures over every row of the period, ungrouped. */
+				totals: UsedValues<D, K>
+				groupBy: readonly (keyof Dm & string)[]
+				/** The query's filters, open-dimension labels already resolved to keys. */
+				filters: readonly NormalizedFilter[]
+				/** The period being resolved: the query's, or its previous one. */
+				period: ResultPeriod
+				tenant: Tenant
+				ctx: Ctx
+			}
+		: never
+
+/** One value per row, in the same order, and one for the totals. */
+export type ResolverOutput = {
+	rows: readonly (number | null)[]
+	totals: number | null
+}
+
+export type MeasureResolver<D, K, Ctx> = (
+	input: ResolverInput<D, K, Ctx>
+) => ResolverOutput | Promise<ResolverOutput>
+
+/** The code for every resolved measure, by dataset and measure. */
+export type AnalyticsResolvers<DS extends readonly AnyDataset[], Ctx> = {
+	[D in DS[number] as [ResolvedKey<D>] extends [never] ? never : D['key']]: {
+		[K in ResolvedKey<D>]: MeasureResolver<D, K, Ctx>
+	}
+}
+
 export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	datasets: DS
 	/** Databases by name; a dataset's `source` picks one, or the only one is used. */
@@ -179,6 +243,13 @@ export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	 * swallowed: a failing cache is a miss, never a failed query.
 	 */
 	cache?: AnalyticsCache<Ctx, DS[number]['key']> | undefined
+	/**
+	 * The code for `measure.resolved` measures, by dataset and measure key: called once per
+	 * period with the result rows and the values of the measures each one uses. Required for
+	 * every resolved measure (`createAnalytics` throws otherwise). What it throws fails the
+	 * query; a value that is not a finite number counts as null.
+	 */
+	resolvers?: NoInfer<AnalyticsResolvers<DS, Ctx>> | undefined
 }
 
 /**
@@ -272,6 +343,9 @@ export type AnalyticsResult<A, Q> =
 
 type ShapedResult = QueryResult<Row, Row>
 
+// biome-ignore lint/suspicious/noExplicitAny: resolvers are typed per dataset where they are declared.
+type AnyResolver = (input: any) => ResolverOutput | Promise<ResolverOutput>
+
 /** A measure or dimension marked with `access`, with every access key it needs. */
 type RestrictedField = {
 	kind: 'measure' | 'dimension'
@@ -316,6 +390,33 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			)
 		}
 		restrictedOf.set(dataset.key, restricted)
+	}
+
+	const resolvers = (options.resolvers ?? {}) as Record<
+		string,
+		Record<string, AnyResolver> | undefined
+	>
+	for (const [datasetKey, entries] of Object.entries(resolvers)) {
+		const dataset = byKey.get(datasetKey)
+		if (!dataset)
+			throw new Error(`Resolvers name unknown dataset ${datasetKey}`)
+		for (const key of Object.keys(entries ?? {})) {
+			const entry: AnyMeasure | undefined = dataset.measures[key]
+			if (entry?.kind !== 'resolved') {
+				throw new Error(
+					`Resolvers name ${datasetKey}.${key}, which is not a resolved measure`
+				)
+			}
+		}
+	}
+	for (const dataset of datasets) {
+		for (const [key, entry] of Object.entries<AnyMeasure>(dataset.measures)) {
+			if (entry.kind === 'resolved' && !resolvers[dataset.key]?.[key]) {
+				throw new Error(
+					`Dataset ${dataset.key} resolves ${key} in the app, but createAnalytics has no resolver for it`
+				)
+			}
+		}
 	}
 
 	const now = options.now ?? (() => new Date())
@@ -507,7 +608,10 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		return { dataset, query, tenant, timezone, period, previous, now: at }
 	}
 
-	const runQuery = async (prepared: Prepared): Promise<ShapedResult> => {
+	const runQuery = async (
+		prepared: Prepared,
+		ctx: Ctx
+	): Promise<ShapedResult> => {
 		const { dataset, query, tenant, timezone, period, previous, now } = prepared
 		const source = sourceFor(dataset)
 		const { dialect } = source
@@ -523,6 +627,8 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			dialect
 		)
 
+		const range = ({ from, to }: ResolvedPeriod) => ({ from, to, timezone })
+
 		const runPeriod = async (target: ResolvedPeriod | null) => {
 			const statements = periodStatements(dataset, query, {
 				tenant,
@@ -536,14 +642,63 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				statements.totals ? run(statements.totals) : null
 			])
 
-			const { rows, truncated } = shapeRows(dataset, query, rawRows, dialect)
+			const { rows, kept, truncated } = shapeRows(
+				dataset,
+				query,
+				rawRows,
+				dialect
+			)
 			const totalsRow = (rawTotals ?? rawRows)[0] ?? {}
 			const totals = shapeMeasures(dataset, query.measures, totalsRow, dialect)
+
+			for (const key of query.measures) {
+				const entry: AnyMeasure | undefined = dataset.measures[key]
+				if (entry?.kind !== 'resolved') continue
+
+				const used = (raw: Row) =>
+					shapeMeasures(dataset, entry.uses, raw, dialect)
+				const resolver = resolvers[dataset.key]?.[key]
+				if (!resolver) throw new Error(`No resolver for ${dataset.key}.${key}`)
+
+				const output = await resolver({
+					rows: kept.map((raw, index) => ({
+						dimensions: Object.fromEntries(
+							query.groupBy.map((group) => [group, rows[index]?.[group]])
+						),
+						values: used(raw)
+					})),
+					totals: used(totalsRow),
+					groupBy: query.groupBy,
+					filters: query.filters.map((filter) => {
+						const resolved = resolvedValues.get(filter.dimension)
+						return resolved && 'values' in filter
+							? { ...filter, values: [...resolved] }
+							: filter
+					}),
+					period: target ? range(target) : { all: true, timezone },
+					tenant,
+					ctx
+				})
+				if (output.rows.length !== rows.length) {
+					throw new Error(
+						`The resolver for ${dataset.key}.${key} returned ${output.rows.length} values for ${rows.length} rows`
+					)
+				}
+
+				const value = (raw: number | null | undefined) => {
+					const finite =
+						typeof raw === 'number' && Number.isFinite(raw) ? raw : null
+					return entry.result === 'count' ? (finite ?? 0) : finite
+				}
+				rows.forEach((row, index) => {
+					row[key] = value(output.rows[index])
+				})
+				totals[key] = value(output.totals)
+			}
 
 			return { rows, totals, truncated }
 		}
 
-		const range = ({ from, to }: ResolvedPeriod) => ({ from, to, timezone })
 		const [current, before] = await Promise.all([
 			runPeriod(period),
 			previous &&
@@ -619,7 +774,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			let result = key ? await cachedResult(key, entry) : null
 			if (key) cache = result ? 'hit' : 'miss'
 			if (!result) {
-				result = await runQuery(prepared)
+				result = await runQuery(prepared, ctx)
 				if (key) store(key, result, entry)
 			}
 
@@ -918,14 +1073,23 @@ function decodeKey(value: unknown, dialect: Dialect): string | number {
  */
 function restrictedFields(dataset: AnyDataset): RestrictedField[] {
 	const measures: Record<string, AnyMeasure> = dataset.measures
-	// defineDataset refuses ratio cycles.
+	// defineDataset refuses ratio cycles, and resolved measures use only SQL measures.
 	const accessOf = (key: string): string[] => {
 		const entry = measures[key]
 		if (!entry) return []
 		const own = entry.access === undefined ? [] : [entry.access]
-		return entry.kind === 'ratio'
-			? [...own, ...accessOf(entry.numerator), ...accessOf(entry.denominator)]
-			: own
+		switch (entry.kind) {
+			case 'ratio':
+				return [
+					...own,
+					...accessOf(entry.numerator),
+					...accessOf(entry.denominator)
+				]
+			case 'resolved':
+				return [...own, ...entry.uses.flatMap(accessOf)]
+			default:
+				return own
+		}
 	}
 
 	return [

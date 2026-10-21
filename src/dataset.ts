@@ -76,7 +76,29 @@ export type RatioMeasure<
 	readonly denominator: B
 }
 
-export type AnyMeasure = AggregateMeasure | ShareMeasure | RatioMeasure
+/**
+ * A value the app computes after the query runs, from the measures it `uses` in each row and
+ * from anything else it can reach (another database, a forecast). The `resolvers` option of
+ * `createAnalytics` supplies the code.
+ */
+export type ResolvedMeasure<
+	R extends MeasureResult = MeasureResult,
+	U extends string = string
+> = {
+	readonly kind: 'resolved'
+	readonly result: R
+	readonly label: string
+	readonly description: string | undefined
+	/** A resolved measure also needs the access of the measures it uses. */
+	readonly access: string | undefined
+	readonly uses: readonly U[]
+}
+
+export type AnyMeasure =
+	| AggregateMeasure
+	| ShareMeasure
+	| RatioMeasure
+	| ResolvedMeasure
 
 /** The TypeScript type of a measure's value in a result row. */
 export type MeasureValue<M> = M extends { result: 'count' }
@@ -198,6 +220,41 @@ export const measure = {
 			numerator,
 			denominator
 		}
+	},
+
+	resolved
+}
+
+/**
+ * A value the app computes after the query runs, for numbers one statement cannot give:
+ * another database, a forecast, a per-day average. `uses` names the measures of this dataset
+ * the resolver reads from each row; they are fetched even when the query does not ask for
+ * them. The code goes in `createAnalytics({ resolvers })`. Queries cannot sort by it, since
+ * the database limits the rows before the value exists.
+ */
+function resolved<R extends MeasureResult, Access extends string = never>(
+	options: Described<Access> & { result: R; uses?: undefined }
+): ResolvedMeasure<R, never> & Marked<NoInfer<Access>>
+function resolved<
+	R extends MeasureResult,
+	const U extends string,
+	Access extends string = never
+>(
+	options: Described<Access> & { result: R; uses: readonly U[] }
+): ResolvedMeasure<R, U> & Marked<NoInfer<Access>>
+function resolved(
+	options: Described & {
+		result: MeasureResult
+		uses?: readonly string[] | undefined
+	}
+): ResolvedMeasure {
+	return {
+		kind: 'resolved',
+		result: options.result,
+		label: options.label,
+		description: options.description,
+		access: options.access,
+		uses: options.uses ?? []
 	}
 }
 
@@ -618,14 +675,24 @@ export type Dataset<
 // biome-ignore lint/suspicious/noExplicitAny: the widest dataset, used only as a constraint.
 export type AnyDataset = Dataset<string, any, any, string>
 
-/** Ratio measures may only name other measures of the same dataset. */
+/** Measures the database computes: everything but resolved measures. */
+export type SqlMeasureKey<M> = {
+	[Key in keyof M & string]: M[Key] extends { kind: 'resolved' } ? never : Key
+}[keyof M & string]
+
+/**
+ * Ratio measures may only name other SQL measures of the same dataset, and resolved measures
+ * may only use SQL measures.
+ */
 type CheckMeasures<M> = {
 	[Key in keyof M]: M[Key] extends { kind: 'ratio' }
 		? {
-				numerator: Exclude<keyof M & string, Key>
-				denominator: Exclude<keyof M & string, Key>
+				numerator: Exclude<SqlMeasureKey<M>, Key>
+				denominator: Exclude<SqlMeasureKey<M>, Key>
 			}
-		: unknown
+		: M[Key] extends { kind: 'resolved' }
+			? { uses: readonly SqlMeasureKey<M>[] }
+			: unknown
 }
 
 /** Time dimensions may only name declared time fields. */
@@ -764,6 +831,14 @@ function validateDataset<DS extends AnyDataset>(dataset: DS): DS {
 			if (entry.denominator) check(entry.denominator, `measure ${key}`)
 		}
 		if (entry.kind === 'ratio') checkRatio(measures, key, [], fail)
+		if (entry.kind === 'resolved') {
+			for (const used of entry.uses) {
+				const usedEntry = measures[used]
+				if (!usedEntry) fail(`measure ${key} uses unknown measure ${used}`)
+				if (usedEntry?.kind === 'resolved')
+					fail(`measure ${key} uses ${used}, which is resolved too`)
+			}
+		}
 	}
 
 	const dimensions: Record<string, AnyDimension> = dataset.dimensions
@@ -820,6 +895,8 @@ function checkRatio(
 
 	const entry = measures[key]
 	if (!entry) fail(`ratio measure ${path.at(-1)} names unknown measure ${key}`)
+	if (entry?.kind === 'resolved')
+		fail(`ratio measure ${path.at(-1)} names ${key}, which is resolved`)
 	if (entry?.kind !== 'ratio') return
 
 	checkRatio(measures, entry.numerator, [...path, key], fail)
