@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/HansKristoffer/measurr/compare/v0.5.0...v0.6.0) (2026-10-21)
+
+
+### Features
+
+* metric registry and presentation shapes ([#9](https://github.com/HansKristoffer/measurr/issues/9)) ([6c0f741](https://github.com/HansKristoffer/measurr/commit/6c0f74119bc3f317c08e7c37cf5ddab7e8a2f504))
+
 ## [0.5.0](https://github.com/HansKristoffer/measurr/compare/v0.4.0...v0.5.0) (2026-10-20)
 
 
