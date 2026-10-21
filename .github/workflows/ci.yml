@@ -52,8 +52,21 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:24-alpine
+        env:
+          CLICKHOUSE_USER: measurr
+          CLICKHOUSE_PASSWORD: measurr
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       ANALYTICS_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      ANALYTICS_TEST_CLICKHOUSE_URL: http://measurr:measurr@localhost:8123
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2

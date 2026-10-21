@@ -5,7 +5,8 @@ import type {
 	AnyMeasure,
 	Dataset,
 	DimensionValue,
-	MeasureValue
+	MeasureValue,
+	SqlMeasureKey
 } from './dataset.js'
 import {
 	MAX_PERIOD_DAYS,
@@ -80,7 +81,7 @@ export type DatasetQuery<DS> =
 				compareToPrevious?: boolean | undefined
 				sort?:
 					| {
-							by: (keyof M & string) | GroupableKey<Dm>
+							by: SqlMeasureKey<M> | GroupableKey<Dm>
 							direction?: 'asc' | 'desc' | undefined
 					  }
 					| undefined
@@ -278,8 +279,12 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 	if (!measureKeys) throw new Error(`Dataset ${dataset.key} has no measures`)
 	const groupKeys = nonEmpty(groupable.map(([key]) => key))
 	const timeKeys = nonEmpty(Object.keys(dataset.time))
+	// The database limits rows before a resolved measure exists, so it cannot sort them.
+	const sqlMeasureKeys = measures
+		.filter(([, entry]) => entry.kind !== 'resolved')
+		.map(([key]) => key)
 	const sortKeys =
-		nonEmpty([...measureKeys, ...(groupKeys ?? [])]) ?? measureKeys
+		nonEmpty([...sqlMeasureKeys, ...(groupKeys ?? [])]) ?? measureKeys
 
 	const notes = groupable
 		.filter(([, dim]) => dim.kind === 'manyToMany' && dim.note)
@@ -362,6 +367,15 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 					code: 'custom',
 					path: ['sort', 'by'],
 					message: `Sort by one of the asked measures or grouped dimensions: ${returned.join(', ')}`
+				})
+			}
+			const sortMeasure: AnyMeasure | undefined =
+				by === undefined ? undefined : dataset.measures[by]
+			if (sortMeasure?.kind === 'resolved') {
+				context.addIssue({
+					code: 'custom',
+					path: ['sort', 'by'],
+					message: `${by} is computed after the query runs and cannot be sorted by`
 				})
 			}
 

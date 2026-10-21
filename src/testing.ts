@@ -11,6 +11,7 @@ import {
 import {
 	type AnyDataset,
 	type AnyDimension,
+	type AnyMeasure,
 	dimension,
 	measure
 } from './dataset.js'
@@ -68,10 +69,14 @@ export async function checkDatasetContract(
 		options.emptyTenant ??
 		(typeof options.tenant === 'number' ? -1 : '__contract_empty_tenant__')
 
+	// Resolved measures are app code: test them where their resolvers live.
+	const sqlMeasures = Object.entries<AnyMeasure>(dataset.measures).filter(
+		([, entry]) => entry.kind !== 'resolved'
+	)
 	const probe: AnyDataset = {
 		...dataset,
 		measures: {
-			...dataset.measures,
+			...Object.fromEntries(sqlMeasures),
 			[COUNT]: measure.count({ label: 'Rows' })
 		},
 		dimensions: {
@@ -131,7 +136,7 @@ export async function checkDatasetContract(
 		})
 	}
 
-	for (const key of Object.keys(dataset.measures)) {
+	for (const [key] of sqlMeasures) {
 		await check(`measure ${key}`, async () => {
 			const value = (await run({ measures: [key] })).totals[key]
 			if (value !== null && typeof value !== 'number')

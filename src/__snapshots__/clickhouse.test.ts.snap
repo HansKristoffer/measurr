@@ -1,0 +1,43 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`clickhouse compiler measures over a period 1`] = `
+"SELECT sumOrNull(\`statuses\`.\`sprays\`) AS \`m_sprays\`, uniqExact(\`statuses\`.\`unitId\`) AS \`m_units\`, quantileExactInclusiveOrNull(0.5)(\`statuses\`.\`batteryLevel\`) AS \`m_medianBattery\`, (toFloat64(countIf((\`statuses\`.\`liquidLow\` = {p1:Int64}))) / nullIf(count(), 0)) AS \`m_lowLiquidShare\`
+FROM \`statuses\` AS \`statuses\` LEFT JOIN \`units\` AS \`units\` ON (\`units\`.\`unitId\` = \`statuses\`.\`unitId\`)
+WHERE (\`units\`.\`organizationId\` = {p2:String}) AND (\`statuses\`.\`createdAt\` >= {p3:DateTime64(3, 'UTC')}) AND (\`statuses\`.\`createdAt\` < {p4:DateTime64(3, 'UTC')})
+SETTINGS join_use_nulls = 1, enable_positional_arguments = 1
+-- values: [1,"A","2026-09-07 22:00:00.000","2026-10-07 22:00:00.000"]"
+`;
+
+exports[`clickhouse compiler grouped by placement and week, filtered by unit and battery 1`] = `
+"SELECT toString(toMonday(toTimeZone(\`statuses\`.\`createdAt\`, 'Europe/Copenhagen'))) AS \`g_week\`, \`units\`.\`placementType\` AS \`g_placement\`, sumOrNull(\`statuses\`.\`sprays\`) AS \`m_sprays\`, (toFloat64(sumOrNull(\`statuses\`.\`sprays\`)) / nullIf(uniqExact(\`statuses\`.\`unitId\`), 0)) AS \`m_spraysPerUnit\`, avgOrNull(\`statuses\`.\`batteryLevel\`) AS \`m_averageBattery\`
+FROM \`statuses\` AS \`statuses\` LEFT JOIN \`units\` AS \`units\` ON (\`units\`.\`unitId\` = \`statuses\`.\`unitId\`)
+WHERE (\`units\`.\`organizationId\` = {p1:String}) AND (\`statuses\`.\`createdAt\` >= {p2:DateTime64(3, 'UTC')}) AND (\`statuses\`.\`createdAt\` < {p3:DateTime64(3, 'UTC')}) AND ((\`units\`.\`unitId\` NOT IN ({p4:String})) OR (\`units\`.\`unitId\` IS NULL)) AND ((\`statuses\`.\`batteryLevel\` >= {p5:Int64}) AND (\`statuses\`.\`batteryLevel\` <= {p6:Int64}))
+GROUP BY 1, 2
+ORDER BY \`g_week\` ASC, \`g_placement\` ASC
+LIMIT 21
+SETTINGS join_use_nulls = 1, enable_positional_arguments = 1
+-- values: ["A","2026-08-31 22:00:00.000","2026-09-30 22:00:00.000","u9",10,90]
+
+SELECT sumOrNull(\`statuses\`.\`sprays\`) AS \`m_sprays\`, (toFloat64(sumOrNull(\`statuses\`.\`sprays\`)) / nullIf(uniqExact(\`statuses\`.\`unitId\`), 0)) AS \`m_spraysPerUnit\`, avgOrNull(\`statuses\`.\`batteryLevel\`) AS \`m_averageBattery\`
+FROM \`statuses\` AS \`statuses\` LEFT JOIN \`units\` AS \`units\` ON (\`units\`.\`unitId\` = \`statuses\`.\`unitId\`)
+WHERE (\`units\`.\`organizationId\` = {p1:String}) AND (\`statuses\`.\`createdAt\` >= {p2:DateTime64(3, 'UTC')}) AND (\`statuses\`.\`createdAt\` < {p3:DateTime64(3, 'UTC')}) AND ((\`units\`.\`unitId\` NOT IN ({p4:String})) OR (\`units\`.\`unitId\` IS NULL)) AND ((\`statuses\`.\`batteryLevel\` >= {p5:Int64}) AND (\`statuses\`.\`batteryLevel\` <= {p6:Int64}))
+SETTINGS join_use_nulls = 1, enable_positional_arguments = 1
+-- values: ["A","2026-08-31 22:00:00.000","2026-09-30 22:00:00.000","u9",10,90]"
+`;
+
+exports[`clickhouse compiler weekday and hour 1`] = `
+"SELECT toDayOfWeek(toTimeZone(\`statuses\`.\`createdAt\`, 'Europe/Copenhagen')) AS \`g_weekday\`, toHour(toTimeZone(\`statuses\`.\`createdAt\`, 'Europe/Copenhagen')) AS \`g_hour\`, sumOrNull(\`statuses\`.\`sprays\`) AS \`m_sprays\`
+FROM \`statuses\` AS \`statuses\` LEFT JOIN \`units\` AS \`units\` ON (\`units\`.\`unitId\` = \`statuses\`.\`unitId\`)
+WHERE (\`units\`.\`organizationId\` = {p1:String}) AND (\`statuses\`.\`createdAt\` >= {p2:DateTime64(3, 'UTC')}) AND (\`statuses\`.\`createdAt\` < {p3:DateTime64(3, 'UTC')}) AND (\`units\`.\`placementType\` IN ({p4:String}))
+GROUP BY 1, 2
+ORDER BY \`g_weekday\` ASC, \`g_hour\` ASC
+LIMIT 21
+SETTINGS join_use_nulls = 1, enable_positional_arguments = 1
+-- values: ["A","2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","OFFICE"]
+
+SELECT sumOrNull(\`statuses\`.\`sprays\`) AS \`m_sprays\`
+FROM \`statuses\` AS \`statuses\` LEFT JOIN \`units\` AS \`units\` ON (\`units\`.\`unitId\` = \`statuses\`.\`unitId\`)
+WHERE (\`units\`.\`organizationId\` = {p1:String}) AND (\`statuses\`.\`createdAt\` >= {p2:DateTime64(3, 'UTC')}) AND (\`statuses\`.\`createdAt\` < {p3:DateTime64(3, 'UTC')}) AND (\`units\`.\`placementType\` IN ({p4:String}))
+SETTINGS join_use_nulls = 1, enable_positional_arguments = 1
+-- values: ["A","2026-09-07 22:00:00.000","2026-10-07 22:00:00.000","OFFICE"]"
+`;
