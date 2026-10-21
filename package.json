@@ -57,6 +57,12 @@
 			"import": "./dist/handler.js",
 			"default": "./dist/handler.js"
 		},
+		"./metrics": {
+			"types": "./dist/metrics.d.ts",
+			"bun": "./src/metrics.ts",
+			"import": "./dist/metrics.js",
+			"default": "./dist/metrics.js"
+		},
 		"./testing": {
 			"types": "./dist/testing.d.ts",
 			"bun": "./src/testing.ts",
@@ -66,7 +72,7 @@
 	},
 	"scripts": {
 		"build": "rm -rf dist && bun run build:js && bun run build:types",
-		"build:js": "bun build ./src/index.ts ./src/dialects/postgres.ts ./src/shapes.ts ./src/handler.ts ./src/testing.ts --root ./src --outdir ./dist --target node --packages external --splitting",
+		"build:js": "bun build ./src/index.ts ./src/dialects/postgres.ts ./src/shapes.ts ./src/handler.ts ./src/metrics.ts ./src/testing.ts --root ./src --outdir ./dist --target node --packages external --splitting",
 		"build:types": "tsgo -p tsconfig.build.json",
 		"prepublishOnly": "bun run build",
 		"test": "bun test",

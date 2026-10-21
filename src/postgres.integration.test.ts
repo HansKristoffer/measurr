@@ -22,6 +22,8 @@ import {
 	orders,
 	sales
 } from './fixtures/orders.js'
+import { orderMetrics } from './fixtures/metrics.js'
+import { createMetricRegistry } from './metrics.js'
 import { toTimeseries } from './shapes.js'
 import { assertDatasetContract } from './testing.js'
 
@@ -563,5 +565,77 @@ describe.skipIf(!url)('postgres integration', () => {
 		}).catch((error: unknown) => error)
 
 		expect(String(failure)).toContain('day buckets of created')
+	})
+
+	test('every registered metric queries and shapes into its kind', async () => {
+		const registry = createMetricRegistry({
+			analytics,
+			metrics: orderMetrics,
+			canRun: (metric, ctx: { tenantId: string; role: 'owner' | 'member' }) =>
+				!metric.allowedRoles || metric.allowedRoles.includes(ctx.role)
+		})
+		const from = new Date(NOW.getTime() - 29 * 86_400_000)
+		const chunks = await Array.fromAsync(
+			registry.run(
+				{
+					metrics: registry.keys.map((key) => ({ key })),
+					from,
+					to: NOW,
+					compareToPrevious: true
+				},
+				{ ...tenantA, role: 'owner' }
+			)
+		)
+
+		expect(chunks.filter((chunk) => chunk.error)).toEqual([])
+		expect(chunks.map((chunk) => chunk.key).sort()).toEqual(
+			[...registry.keys].sort()
+		)
+		for (const chunk of chunks) {
+			expect(chunk.result?.current.kind).toBe(registry.get(chunk.key).kind)
+		}
+		expect(chunks.at(-1)?.done).toBe(true)
+
+		const byKey = new Map(chunks.map((chunk) => [chunk.key, chunk.result]))
+		expect(byKey.get('orders.count')).toEqual({
+			current: { kind: 'kpi', value: 4, label: 'Orders' },
+			previous: { kind: 'kpi', value: 1, label: 'Orders' },
+			supportsTimeRange: true
+		})
+		expect(byKey.get('orders.byStatus')).toMatchObject({
+			current: {
+				total: 5,
+				segments: [
+					{ key: 'OPEN', value: 1 },
+					{ key: 'PAID', value: 3 },
+					{ key: 'REFUNDED', value: 1 }
+				]
+			}
+		})
+		expect(byKey.get('orders.byStatus')?.previous).toBeUndefined()
+		const trend = byKey.get('orders.trend')
+		const days = (output: unknown) =>
+			(
+				output as { series: { points: { ts: Date }[] }[] }
+			).series[0]?.points.map((point) => point.ts)
+		expect(days(trend?.current)).toHaveLength(30)
+		expect(days(trend?.previous)).toEqual(days(trend?.current))
+	})
+
+	test('a role outside the metric is denied, not run', async () => {
+		const registry = createMetricRegistry({
+			analytics,
+			metrics: orderMetrics,
+			canRun: (metric, ctx: { tenantId: string; role: 'owner' | 'member' }) =>
+				!metric.allowedRoles || metric.allowedRoles.includes(ctx.role)
+		})
+		const [chunk] = await Array.fromAsync(
+			registry.run(
+				{ metrics: [{ key: 'orders.paidShare' }] },
+				{ ...tenantA, role: 'member' }
+			)
+		)
+
+		expect(chunk).toMatchObject({ error: 'Access denied', done: true })
 	})
 })
