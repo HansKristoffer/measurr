@@ -5,6 +5,12 @@ import { orders } from './fixtures/orders.js'
 import { createAnalytics } from './index.js'
 import { bucketStarts } from './period.js'
 import {
+	isKpi,
+	isTimeSeries,
+	presentDistribution,
+	presentKpi,
+	presentLeaderboard,
+	presentTimeseries,
 	toDistribution,
 	toKpi,
 	toLeaderboard,
@@ -342,4 +348,172 @@ test('a dimension the query did not group by is an error', async () => {
 	expect(() =>
 		toDistribution(result, { by: 'region' as never, measure: 'orders' })
 	).toThrow('not grouped by region')
+})
+
+describe('presentation', () => {
+	test('a KPI is 0 when missing, and a share is a percentage', async () => {
+		const result = await analyticsAnswering({
+			totals: { m_paidShare: 0.25, m_averageAmount: null }
+		}).query(
+			{
+				dataset: 'orders',
+				measures: ['paidShare', 'averageAmount'],
+				period: week
+			},
+			{}
+		)
+
+		expect(
+			presentKpi(result, 'paidShare', { label: 'Paid', percent: true })
+		).toEqual({ kind: 'kpi', value: 25, unit: 'PERCENTAGE', label: 'Paid' })
+		const average = presentKpi(result, 'averageAmount', { suffix: 'kr' })
+		expect(average).toEqual({ kind: 'kpi', value: 0, suffix: 'kr' })
+		expect(isKpi(average)).toBe(true)
+		expect(isTimeSeries(average)).toBe(false)
+	})
+
+	test('a series has wire keys, labels, dates and 0 for empty buckets', async () => {
+		const result = await analyticsAnswering({
+			rows: [
+				{ g_day: '2026-10-01', g_status: 'PAID', m_orders: 2 },
+				{ g_day: '2026-10-02', g_status: 'OPEN', m_orders: 1 }
+			],
+			totals: { m_orders: 3 }
+		}).query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['day', 'status'],
+				period: { from: '2026-10-01', to: '2026-10-02' },
+				limit: 100
+			},
+			{}
+		)
+
+		expect(
+			presentTimeseries(result, {
+				bucket: 'day',
+				measure: 'orders',
+				series: 'status',
+				keys: { PAID: 'paid' },
+				labels: { paid: 'Settled' },
+				chartType: 'line'
+			})
+		).toEqual({
+			kind: 'timeseries',
+			granularity: 'day',
+			series: [
+				{
+					key: 'paid',
+					label: 'Settled',
+					points: [
+						{ ts: new Date('2026-10-01T00:00:00.000Z'), value: 2 },
+						{ ts: new Date('2026-10-02T00:00:00.000Z'), value: 0 }
+					],
+					chartType: 'line'
+				},
+				{
+					key: 'OPEN',
+					label: 'Open',
+					points: [
+						{ ts: new Date('2026-10-01T00:00:00.000Z'), value: 0 },
+						{ ts: new Date('2026-10-02T00:00:00.000Z'), value: 1 }
+					],
+					chartType: 'line'
+				}
+			]
+		})
+	})
+
+	test('segments add up to their own total, in the given order', async () => {
+		// Many-to-many: 7 orders, but tags count 6 + 4 + 2.
+		const result = await analyticsAnswering({
+			rows: [
+				{ g_tag: 't1', g_tag__label: 'Complaint', m_orders: 6 },
+				{ g_tag: null, g_tag__label: null, m_orders: 2 },
+				{ g_tag: 't2', g_tag__label: 'Praise', m_orders: 4 }
+			],
+			totals: { m_orders: 7 }
+		}).query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['tag'],
+				period: week
+			},
+			{}
+		)
+
+		expect(
+			presentDistribution(result, {
+				by: 'tag',
+				measure: 'orders',
+				chartType: 'bar',
+				keys: { null: 'untagged' },
+				labels: { untagged: 'Not tagged' },
+				order: ['t2', 't1']
+			})
+		).toEqual({
+			kind: 'distribution',
+			total: 12,
+			segments: [
+				{ key: 't2', label: 'Praise', value: 4, percent: (4 / 12) * 100 },
+				{ key: 't1', label: 'Complaint', value: 6, percent: 50 },
+				{
+					key: 'untagged',
+					label: 'Not tagged',
+					value: 2,
+					percent: (2 / 12) * 100
+				}
+			],
+			chartType: 'bar'
+		})
+	})
+
+	test('leaderboard rows carry string ids and meta from every measure', async () => {
+		const result = await analyticsAnswering({
+			rows: [
+				{
+					g_region: 'r1',
+					g_region__label: 'North',
+					m_orders: 9,
+					m_revenue: 900
+				},
+				{
+					g_region: null,
+					g_region__label: null,
+					m_orders: null,
+					m_revenue: null
+				}
+			],
+			totals: { m_orders: 9, m_revenue: 900 }
+		}).query(
+			{
+				dataset: 'orders',
+				measures: ['orders', 'revenue'],
+				groupBy: ['region']
+			},
+			{}
+		)
+
+		expect(
+			presentLeaderboard(result, {
+				by: 'region',
+				measure: 'orders',
+				meta: (values) => ({ revenue: values.revenue ?? null })
+			})
+		).toEqual({
+			kind: 'leaderboard',
+			items: [
+				{ rank: 1, id: 'r1', label: 'North', value: 9, meta: { revenue: 900 } },
+				{
+					rank: 2,
+					id: 'null',
+					label: 'No region',
+					value: 0,
+					meta: { revenue: null }
+				}
+			]
+		})
+	})
 })

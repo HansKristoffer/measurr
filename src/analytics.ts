@@ -255,6 +255,11 @@ export type Analytics<DS extends readonly AnyDataset[], Ctx> = {
 	}): Promise<z.ZodType<DatasetQuery<DS[number]>>>
 	/** The result schema for one dataset. */
 	resultSchema(dataset: DS[number]['key']): z.ZodType<QueryResult<Row, Row>>
+	/**
+	 * The timezone `ctx`'s periods and buckets resolve in: the `timezone` hook's answer, UTC
+	 * when it has none. Rejects with `invalid_timezone` for a name the runtime does not know.
+	 */
+	timezone(ctx: Ctx): Promise<string>
 	/** The datasets `ctx` may query, with the measures and dimensions it may use. */
 	listDatasets(ctx: Ctx): Promise<DatasetCatalogEntry<DS[number]['key']>[]>
 }
@@ -419,6 +424,17 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	}
 
 	/** Parse, authorize, and resolve everything that comes from hooks. */
+	const timezoneOf = async (ctx: Ctx) => {
+		const timezone = (await options.timezone?.(ctx)) || 'UTC'
+		if (!isValidTimezone(timezone)) {
+			throw new AnalyticsError(
+				'invalid_timezone',
+				`Unknown timezone ${timezone}`
+			)
+		}
+		return timezone
+	}
+
 	const prepare = async (input: unknown, ctx: Ctx): Promise<Prepared> => {
 		const parsed = querySchemaFor(datasets).safeParse(input)
 		if (!parsed.success) {
@@ -471,14 +487,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			)
 		}
 
-		const timezone = (await options.timezone?.(ctx)) || 'UTC'
-		if (!isValidTimezone(timezone)) {
-			throw new AnalyticsError(
-				'invalid_timezone',
-				`Unknown timezone ${timezone}`
-			)
-		}
-
+		const timezone = await timezoneOf(ctx)
 		const query = normalizeQuery(dataset, parsedQuery)
 		const at = now()
 		let period: ResolvedPeriod | null
@@ -678,6 +687,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 						schemaOptions?.datasets?.map(datasetOf) ?? datasets
 					)) as Analytics<DS, Ctx>['querySchema'],
 		resultSchema: (key) => resultSchemaFor(key) as z.ZodType<ShapedResult>,
+		timezone: timezoneOf,
 		listDatasets: async (ctx) =>
 			(await allowedDatasets(ctx)).map(
 				(dataset) =>

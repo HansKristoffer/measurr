@@ -118,7 +118,7 @@ export function toTimeseries<R extends AnyResult>(
 		bucket: DimensionOf<R>
 		unit: 'day' | 'week' | 'month'
 		measure: MeasureOf<R>
-		series?: DimensionOf<R>
+		series?: DimensionOf<R> | undefined
 		fill?: number | null
 	}
 ): TimeseriesShape {
@@ -292,4 +292,279 @@ function sortNumeric(values: DimensionValue[]): DimensionValue[] {
 	return values.every((value) => typeof value.key === 'number')
 		? [...values].sort((a, b) => Number(a.key) - Number(b.key))
 		: values
+}
+
+// ---------------------------------------------------------------------------------------------
+// Presentation: what a dashboard draws. Keys are strings, a missing value is 0, a share is
+// 0-100, and labels, units and chart types are the caller's to choose.
+
+export type TimeGranularity =
+	| 'hour'
+	| 'day'
+	| 'week'
+	| 'month'
+	| 'quarter'
+	| 'year'
+
+/** Scalar values a series or a leaderboard row can carry along. */
+export type ScalarMeta = Record<string, string | number | boolean | null>
+
+export type KpiOutput = {
+	kind: 'kpi'
+	value: number
+	label?: string
+	/** A currency code, or `'PERCENTAGE'` for a share (`percent: true`). */
+	unit?: string
+	prefix?: string
+	suffix?: string
+	trend?: 'up' | 'down' | 'flat'
+}
+
+export type TimeSeriesPoint = {
+	/** The bucket's local start date as UTC midnight (`2026-10-01T00:00:00.000Z`). */
+	ts: Date
+	value: number
+	label?: string
+}
+
+export type TimeSeriesSeries<
+	SeriesKey extends string = string,
+	Meta = ScalarMeta | undefined
+> = {
+	key: SeriesKey
+	label?: string
+	points: TimeSeriesPoint[]
+	chartType?: 'line' | 'bar'
+	axis?: 'left' | 'right'
+	meta?: Meta
+}
+
+export type TimeSeriesOutput<
+	SeriesKey extends string = string,
+	Meta = ScalarMeta | undefined
+> = {
+	kind: 'timeseries'
+	granularity: TimeGranularity
+	series: TimeSeriesSeries<SeriesKey, Meta>[]
+}
+
+export type DistributionSegment<Key extends string = string> = {
+	key: Key
+	label: string
+	value: number
+	/** 0-100. */
+	percent?: number
+}
+
+export type DistributionChartType = 'bar' | 'donut' | 'pie' | 'funnel'
+
+export type DistributionOutput<Key extends string = string> = {
+	kind: 'distribution'
+	total: number
+	segments: DistributionSegment<Key>[]
+	chartType?: DistributionChartType
+}
+
+export type TableColumn<Key extends string = string> = {
+	key: Key
+	label: string
+	type?: 'string' | 'number' | 'date' | 'boolean'
+	nullable?: boolean
+}
+
+export type TableOutput<
+	Row = Record<string, unknown>,
+	ColumnKey extends string = string
+> = {
+	kind: 'table'
+	columns: TableColumn<ColumnKey>[]
+	rows: Row[]
+	total?: number
+}
+
+export type PivotOutput = {
+	kind: 'pivot'
+	rowDimension: { key: string; label: string }
+	columnDimension: { key: string; label: string }
+	rows: string[]
+	columns: string[]
+	/** `values[row][column]`. */
+	values: number[][]
+	/** Same shape as `values`; empty strings for cells without one. */
+	cellTooltips?: string[][]
+	totals?: {
+		rowTotals?: number[]
+		columnTotals?: number[]
+		grandTotal?: number
+	}
+}
+
+export type LeaderboardItem<Meta = ScalarMeta | undefined> = {
+	rank: number
+	id: string
+	label: string
+	value: number
+	meta?: Meta
+}
+
+export type LeaderboardOutput<Meta = ScalarMeta | undefined> = {
+	kind: 'leaderboard'
+	items: LeaderboardItem<Meta>[]
+	total?: number
+}
+
+export interface OutputKindMap {
+	kpi: KpiOutput
+	timeseries: TimeSeriesOutput
+	distribution: DistributionOutput
+	table: TableOutput
+	leaderboard: LeaderboardOutput
+	pivot: PivotOutput
+}
+
+export type OutputKind = keyof OutputKindMap
+
+export type OutputForKind<K extends OutputKind> = OutputKindMap[K]
+
+export type MetricOutput = OutputKindMap[OutputKind]
+
+export const isKpi = (output: MetricOutput): output is KpiOutput =>
+	output.kind === 'kpi'
+export const isTimeSeries = (
+	output: MetricOutput
+): output is TimeSeriesOutput => output.kind === 'timeseries'
+export const isDistribution = (
+	output: MetricOutput
+): output is DistributionOutput => output.kind === 'distribution'
+export const isTable = (output: MetricOutput): output is TableOutput =>
+	output.kind === 'table'
+export const isLeaderboard = (
+	output: MetricOutput
+): output is LeaderboardOutput => output.kind === 'leaderboard'
+export const isPivot = (output: MetricOutput): output is PivotOutput =>
+	output.kind === 'pivot'
+
+/** Wire keys by key (`String(key)`, so `'null'` names the empty group). */
+type Renames = Readonly<Record<string, string>>
+
+const rename = (renames: Renames | undefined, key: string | number | null) =>
+	renames?.[String(key)] ?? String(key)
+
+export function presentKpi<R extends AnyResult>(
+	result: R,
+	measure: MeasureOf<R>,
+	display: Omit<KpiOutput, 'kind' | 'value'> & {
+		/** A 0-1 share, drawn as 0-100 with the unit `'PERCENTAGE'`. */
+		percent?: boolean
+	} = {}
+): KpiOutput {
+	const { percent, ...rest } = display
+	const value = toKpi(result, measure).value ?? 0
+
+	return percent
+		? { kind: 'kpi', value: value * 100, unit: 'PERCENTAGE', ...rest }
+		: { kind: 'kpi', value, ...rest }
+}
+
+export function presentTimeseries<R extends AnyResult>(
+	result: R,
+	options: {
+		bucket: DimensionOf<R> & ('day' | 'week' | 'month')
+		measure: MeasureOf<R>
+		/** The dimension each series is; one series named after the measure without it. */
+		series?: DimensionOf<R> | undefined
+		/** Wire keys for series keys (or the measure). */
+		keys?: Renames
+		/** Labels by wire key, where the dataset's are not the ones to show. */
+		labels?: Renames
+		chartType?: 'line' | 'bar'
+	}
+): TimeSeriesOutput {
+	const shape = toTimeseries(result, {
+		bucket: options.bucket,
+		unit: options.bucket,
+		measure: options.measure,
+		series: options.series
+	})
+
+	return {
+		kind: 'timeseries',
+		granularity: options.bucket,
+		series: shape.series.map((series) => {
+			const key = rename(options.keys, series.key)
+			return {
+				key,
+				label: options.labels?.[key] ?? series.label,
+				points: series.points.map((point) => ({
+					ts: new Date(`${point.bucket}T00:00:00.000Z`),
+					value: point.value ?? 0
+				})),
+				...(options.chartType && { chartType: options.chartType })
+			}
+		})
+	}
+}
+
+/**
+ * Segments in query order (or `order`), with a `total` the segments add up to, so a
+ * many-to-many split still has percentages that sum to 100.
+ */
+export function presentDistribution<R extends AnyResult>(
+	result: R,
+	options: {
+		by: DimensionOf<R>
+		measure: MeasureOf<R>
+		chartType?: DistributionChartType
+		keys?: Renames
+		labels?: Renames
+		/** Segment order by wire key; keys it does not list go last. */
+		order?: readonly string[]
+	}
+): DistributionOutput {
+	const segments = toDistribution(result, options).segments.map((segment) => {
+		const key = rename(options.keys, segment.key)
+		return {
+			key,
+			label: options.labels?.[key] ?? segment.label,
+			value: segment.value ?? 0
+		}
+	})
+	const { order } = options
+	if (order) {
+		const rank = (key: string) =>
+			order.includes(key) ? order.indexOf(key) : order.length
+		segments.sort((a, b) => rank(a.key) - rank(b.key))
+	}
+	const total = segments.reduce((sum, segment) => sum + segment.value, 0)
+
+	return {
+		kind: 'distribution',
+		total,
+		segments: segments.map((segment) => ({
+			...segment,
+			percent: total > 0 ? (segment.value / total) * 100 : 0
+		})),
+		...(options.chartType && { chartType: options.chartType })
+	}
+}
+
+export function presentLeaderboard<R extends AnyResult>(
+	result: R,
+	options: {
+		by: DimensionOf<R>
+		measure: MeasureOf<R>
+		/** What each row carries besides its value, from every measure of the row. */
+		meta?: (values: Measures) => ScalarMeta
+	}
+): LeaderboardOutput {
+	return {
+		kind: 'leaderboard',
+		items: toLeaderboard(result, options).items.map((item) => ({
+			rank: item.rank,
+			id: String(item.key),
+			label: item.label,
+			value: item.value ?? 0,
+			...(options.meta && { meta: options.meta(item.values) })
+		}))
+	}
 }

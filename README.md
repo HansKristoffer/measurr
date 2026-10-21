@@ -242,6 +242,95 @@ toLeaderboard(result, { by: 'region', measure: 'revenue' }) // ranked rows with 
 - `toDistribution`'s `total` is the measure over every row, so many-to-many shares can add up to
   more than 1. `toPivot` sorts numeric keys (weekdays, hours).
 
+### Presentation
+
+`presentKpi`, `presentTimeseries`, `presentDistribution` and `presentLeaderboard` turn a result
+into the wire outputs a dashboard draws (`KpiOutput`, `TimeSeriesOutput`, `DistributionOutput`,
+`LeaderboardOutput`; `TableOutput` and `PivotOutput` for outputs you build yourself). A missing
+value is 0, keys are strings, and the caller picks labels, units and chart types:
+
+```ts
+presentKpi(result, 'paidShare', { label: 'Paid', percent: true })
+// { kind: 'kpi', value: 25, unit: 'PERCENTAGE', label: 'Paid' }
+
+presentTimeseries(result, {
+	bucket: 'day', measure: 'orders', series: 'status',
+	keys: { PAID: 'paid' }, // wire keys, by String(key); 'null' names the empty group
+	labels: { paid: 'Settled' }, // labels by wire key
+	chartType: 'line'
+})
+// points are { ts: Date, value }: ts is the bucket's local start date as UTC midnight
+
+presentDistribution(result, { by: 'tag', measure: 'orders', chartType: 'donut', order: ['t2'] })
+// total is what the segments add up to, percent is 0-100; keys order omits go last
+
+presentLeaderboard(result, { by: 'region', measure: 'orders', meta: (values) => ({ revenue: values.revenue }) })
+```
+
+`isKpi`, `isTimeSeries`, `isDistribution`, `isTable`, `isLeaderboard` and `isPivot` narrow a
+`MetricOutput`. The module is pure, so a browser bundle can import the types and guards.
+
+## Dashboard metrics
+
+`measurr/metrics` names the numbers a dashboard shows: one query and the output it is drawn
+in. The registry runs a batch for a caller and streams one chunk per metric.
+
+```ts
+import { createMetricRegistry, metricDefiner } from 'measurr/metrics'
+import { presentKpi, presentTimeseries } from 'measurr/shapes'
+
+// Types only, so metric modules need not import the analytics instance.
+export const defineMetric = metricDefiner<(typeof datasets)[number], Role>()
+
+const orderTrend = defineMetric({
+	key: 'orders.trend',
+	kind: 'timeseries',
+	description: 'Orders over time',
+	allowedRoles: ['owner', 'member'],
+	supportsTimeRange: true, // false for a snapshot: all time, no previous period
+	filterSchema: z.object({ status: z.enum(['OPEN', 'PAID']).optional() }),
+	query: ({ bucket, filters }) => ({
+		dataset: 'orders',
+		measures: ['orders'],
+		groupBy: [bucket],
+		filters: filters.status ? [{ dimension: 'status', op: 'in', values: [filters.status] }] : [],
+		limit: 100
+	}),
+	shape: (result, { bucket }) =>
+		presentTimeseries(result, { bucket, measure: 'orders', chartType: 'bar' })
+})
+
+export const metrics = createMetricRegistry({
+	analytics,
+	metrics: [orderTrend, orderCount] as const,
+	canRun: (metric, ctx) => ctx.isSuperAdmin || (metric.allowedRoles ?? []).includes(ctx.role),
+	onShapeError: (error, metric) => logger.error('metric.shape_failed', { key: metric.key, error })
+})
+
+const input = metrics.requestSchema.extend({ refresh: z.boolean().default(false) }).parse(body)
+for await (const chunk of metrics.run(input, ctx)) send(chunk)
+// { key, requestKey, result: { current, previous?, supportsTimeRange }, done }
+// or { key, requestKey, error, done }
+```
+
+- `query` returns the query without `period` or `compareToPrevious`. The registry counts the
+  local days `from` and `to` (instants) fall on in `analytics.timezone(ctx)`, all time without
+  them, and always all time for a snapshot. `compareToPrevious` adds the previous period, whose
+  series points are put on the current buckets so a chart overlays them.
+- `granularity` (hour to year, inferred from the range when omitted: day up to 31 days, week up
+  to 90, else month) picks `run.bucket`: `day`, `week` or `month`. Name time-bucket dimensions
+  after them so `groupBy: [bucket]` works.
+- A metric that `canRun` refuses (`'Access denied'`), whose filters do not parse with its
+  `filterSchema` (`'Invalid filters: ...'`), whose query fails (the engine's message) or whose
+  `shape` throws (`'The metric could not be drawn'`) fails alone. `done` marks the last chunk.
+- `metricDefiner<Datasets, Role, Extra>()` takes the app's own definition fields as `Extra`
+  (catalog metadata, UI hints for filters); the registry carries them to `canRun` and
+  `available` without reading them.
+- Keys and outputs stay literal: a chunk narrows to its metric by `key`, and
+  `MetricOutputOf<typeof metrics, 'orders.trend'>`, `MetricFiltersOf`, `MetricKeysOfKind` and
+  `registry.get(key)` are typed per metric. `registry.available(ctx)` lists what `canRun`
+  allows, for a catalog.
+
 ## Serving queries
 
 `measurr/handler` serves queries from any server framework:
@@ -517,7 +606,9 @@ Kept stable for publishing: `createAnalytics` and its options (with `authorize`,
 `streamBatch`, `toHttpError`); and the types `AnalyticsQuery`, `AnalyticsResult`,
 `ResultPeriod`, `PeriodInput`, `Tenant`, `TenantId`, `AccessKey`, `AnalyticsCache`, `FieldKey`,
 `Ratio`, `AnalyticsError` codes and their details (`isAnalyticsError`). `ExprNode` and
-`SelectStatement` are exported for dialect authors and may grow new node kinds.
+`SelectStatement` are exported for dialect authors and may grow new node kinds. The
+presenters and wire outputs in `measurr/shapes`, `measurr/metrics` and `analytics.timezone`
+are new and may still change before they join this list.
 
 ## Install
 
