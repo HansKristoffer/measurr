@@ -60,7 +60,7 @@ jobs:
         ports:
           - 8123:8123
         options: >-
-          --health-cmd "wget -qO- http://localhost:8123/ping"
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
