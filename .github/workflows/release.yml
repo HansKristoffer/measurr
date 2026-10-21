@@ -26,8 +26,11 @@ jobs:
       created: ${{ steps.rp.outputs.release_created }}
       tag: ${{ steps.rp.outputs.tag_name }}
     steps:
+      # With RELEASE_PLEASE_TOKEN set, the release PR starts CI itself; GITHUB_TOKEN events start no workflows.
       - uses: googleapis/release-please-action@v4
         id: rp
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
   publish:
     needs: release-please
     if: always() && (needs.release-please.outputs.created == 'true' || github.event_name == 'workflow_dispatch')
