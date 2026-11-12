@@ -8,7 +8,8 @@ import { z } from 'zod'
 import {
 	type Analytics,
 	AnalyticsError,
-	type AnalyticsErrorCode
+	type AnalyticsErrorCode,
+	type QueryBatch
 } from './analytics.js'
 import type { AnyDataset } from './dataset.js'
 import {
@@ -22,6 +23,7 @@ import {
 	type DatasetQuery,
 	periodOutput,
 	periodSchema,
+	type QueryRules,
 	type ResultOf,
 	type ResultPeriod
 } from './query.js'
@@ -60,22 +62,43 @@ export type MetricResolveRun<Filters, Ctx = unknown> = MetricRun<
 	signal: AbortSignal
 }
 
+/**
+ * The query the registry runs for a metric's `query`: a grouped query gets no totals unless it
+ * says `totals: true`, since they cost a statement per period and the presenters do not read
+ * them. A query that does not group has them for free.
+ */
+type AsRun<Q> = Q extends { totals: boolean }
+	? Q
+	: Q extends { groupBy: readonly [] }
+		? Q
+		: Q extends { groupBy: readonly unknown[] }
+			? Q & { totals: false }
+			: Q
+
 /** A result as `shape` receives it: one period, without `previous`. */
-export type MetricQueryResult<DS, Q> = ForShape<ResultOf<DS, Q>>
+export type MetricQueryResult<DS, Q> = ForShape<ResultOf<DS, AsRun<Q>>>
 type ForShape<R> = R extends unknown
 	? Omit<R, 'previous' | 'period'> & { period: ResultPeriod }
 	: never
 
-type MetricBase<Key extends string, Kind extends OutputKind, Filters, Role> = {
+/** A metric that takes no filters. */
+type NoFilters = z.ZodType<Record<string, never>, Record<string, never>>
+
+type MetricBase<
+	Key extends string,
+	Kind extends OutputKind,
+	Schema extends z.ZodType
+> = {
 	key: Key
 	kind: Kind
 	description: string
-	/** For `canRun`; the registry does not read it. */
-	allowedRoles?: readonly Role[] | undefined
-	/** False for a snapshot of now: it counts all time and has no previous period. */
-	supportsTimeRange: boolean
+	/**
+	 * False for a snapshot of now: it counts all time and has no previous period. True when
+	 * omitted.
+	 */
+	supportsTimeRange?: boolean | undefined
 	/** Parses the request's filters for this metric; no filters when omitted. */
-	filterSchema?: z.ZodType<Filters> | undefined
+	filterSchema?: Schema | undefined
 }
 
 /** A metric over a dataset: the query, and the output its result is drawn in. */
@@ -83,18 +106,21 @@ export type MetricDefinition<
 	DS extends AnyDataset,
 	Key extends string,
 	Kind extends OutputKind,
-	Filters,
+	Schema extends z.ZodType,
 	Q extends DatasetQuery<DS>,
 	Output extends OutputForKind<Kind>,
-	Role extends string = string,
 	Ctx = unknown
-> = MetricBase<Key, Kind, Filters, Role> & {
-	/** The query, without `period` or `compareToPrevious`: the registry sets those. */
-	query: (run: MetricRun<Filters, Ctx>) => Q
+> = MetricBase<Key, Kind, Schema> & {
+	/**
+	 * The query, without `period` or `compareToPrevious`: the registry sets those. A grouped
+	 * query runs without totals unless it says `totals: true`, and a `timeseries` or `pivot`
+	 * metric that names no `limit` gets the highest one the analytics instance allows.
+	 */
+	query: (run: MetricRun<z.output<Schema>, Ctx>) => Q
 	/** Called once for the period and once for the previous period. */
 	shape: (
 		result: MetricQueryResult<DS, Q>,
-		run: MetricRun<Filters, Ctx>
+		run: MetricRun<z.output<Schema>, Ctx>
 	) => Output
 	resolve?: undefined
 }
@@ -106,43 +132,58 @@ export type MetricDefinition<
 export type ResolveMetricDefinition<
 	Key extends string,
 	Kind extends OutputKind,
-	Filters,
+	Schema extends z.ZodType,
 	Output extends OutputForKind<Kind>,
-	Role extends string = string,
 	Ctx = unknown
-> = MetricBase<Key, Kind, Filters, Role> & {
+> = MetricBase<Key, Kind, Schema> & {
 	/** Called once for the period and, with `compareToPrevious`, once for the previous one. */
-	resolve: (run: MetricResolveRun<Filters, Ctx>) => Output | Promise<Output>
+	resolve: (
+		run: MetricResolveRun<z.output<Schema>, Ctx>
+	) => Output | Promise<Output>
 	query?: undefined
 	shape?: undefined
 }
 
+/** What a metric's query leaves out: the registry sets both from the request. */
+type SetByRegistry = { period?: undefined; compareToPrevious?: undefined }
+
+/** The datasets (as a union) and the context of an analytics instance's type. */
+type DatasetOf<A> = A extends {
+	readonly datasets: infer DS extends readonly AnyDataset[]
+}
+	? DS[number]
+	: never
+type CtxOf<A> = A extends { scope(ctx: infer Ctx): unknown } ? Ctx : never
+
 /**
- * `defineMetric` for metrics over the datasets `DS` (a union), with `allowedRoles` typed as
- * `Role`, the app's own fields `Extra` (catalog metadata, say), which the registry carries
- * along but does not read, and the context `Ctx` that `run.ctx` is. Types only, so metric
- * modules need not import the analytics instance:
+ * `defineMetric` for the metrics of an analytics instance: queries are typed by its datasets
+ * and `run.ctx` by its context. `Extra` is the app's own fields (the roles a metric allows,
+ * catalog metadata), which the registry carries to `canRun` and `available` without reading
+ * them. Types only, so metric modules import nothing at runtime:
  *
  * ```ts
- * export const defineMetric = metricDefiner<(typeof datasets)[number], Role, {}, Ctx>()
+ * export const defineMetric = metricDefiner<
+ * 	typeof analytics,
+ * 	{ allowedRoles?: readonly Role[] }
+ * >()
  * ```
  */
 export function metricDefiner<
-	DS extends AnyDataset,
-	Role extends string = string,
-	Extra extends object = Record<never, never>,
-	Ctx = unknown
+	A extends { readonly datasets: readonly AnyDataset[] },
+	Extra extends object = Record<never, never>
 >() {
 	return <
 		const Key extends string,
 		const Kind extends OutputKind,
-		Filters,
-		const Q extends DatasetQuery<DS>,
-		Output extends OutputForKind<Kind>
+		const Q extends QueryRules<DatasetOf<A>, Q> &
+			SetByRegistry &
+			DatasetQuery<DatasetOf<A>>,
+		Output extends OutputForKind<Kind>,
+		Schema extends z.ZodType = NoFilters
 	>(
 		definition: (
-			| MetricDefinition<DS, Key, Kind, Filters, Q, Output, Role, Ctx>
-			| ResolveMetricDefinition<Key, Kind, Filters, Output, Role, Ctx>
+			| MetricDefinition<DatasetOf<A>, Key, Kind, Schema, Q, Output, CtxOf<A>>
+			| ResolveMetricDefinition<Key, Kind, Schema, Output, CtxOf<A>>
 		) &
 			Extra
 	) => definition
@@ -153,8 +194,7 @@ export type AnyMetric = {
 	key: string
 	kind: OutputKind
 	description: string
-	allowedRoles?: readonly string[] | undefined
-	supportsTimeRange: boolean
+	supportsTimeRange?: boolean | undefined
 	// biome-ignore lint/suspicious/noExplicitAny: every metric has its own filters and result
 	filterSchema?: z.ZodType<any> | undefined
 } & (
@@ -199,13 +239,23 @@ export type MetricOutputOf<
 	K extends MetricKeyOf<R>
 > = OutputOfMetric<MetricOf<R, K>>
 
+/** The filters metric `K` runs with: what its `filterSchema` parses to. */
 export type MetricFiltersOf<
 	R extends { metrics: readonly AnyMetric[] },
 	K extends MetricKeyOf<R>
-> =
-	NonNullable<MetricOf<R, K>['filterSchema']> extends z.ZodType<infer F>
-		? F
-		: Record<string, never>
+> = z.output<FilterSchemaOf<MetricOf<R, K>>>
+
+/** The filters a request gives metric `K`: what its `filterSchema` accepts. */
+export type MetricFiltersInputOf<
+	R extends { metrics: readonly AnyMetric[] },
+	K extends MetricKeyOf<R>
+> = z.input<FilterSchemaOf<MetricOf<R, K>>>
+
+type FilterSchemaOf<M> = M extends { filterSchema?: infer S }
+	? Exclude<S, undefined> extends z.ZodType
+		? Exclude<S, undefined>
+		: NoFilters
+	: NoFilters
 
 export type MetricKeysOfKind<
 	R extends { metrics: readonly AnyMetric[] },
@@ -320,8 +370,9 @@ export type MetricRegistry<M extends readonly AnyMetric[], Ctx> = {
 	/** The metrics `canRun` allows for `ctx`. */
 	available(ctx: Ctx): Promise<M[number][]>
 	/**
-	 * Runs the requested metrics in parallel and yields each as it finishes. A metric `ctx` may
-	 * not run, or whose filters do not parse, fails alone. A metric that supports a time range
+	 * Runs the requested metrics in parallel and yields each as it finishes. Metrics that count
+	 * the same rows without grouping (the same dataset, filters and period) are read in one
+	 * statement. A metric `ctx` may not run, or whose filters do not parse, fails alone. A metric that supports a time range
 	 * counts the request's period (all time without one) and compares with the previous period
 	 * when asked; a snapshot counts all time. A request with `period` and `from`, or `to`
 	 * without `from`, rejects with `invalid_period`.
@@ -340,7 +391,11 @@ export type MetricRegistry<M extends readonly AnyMetric[], Ctx> = {
 	/** One metric's result; rejects with a `MetricError` when it fails. */
 	one<K extends M[number]['key']>(
 		key: K,
-		request: RequestPeriod & { filters?: unknown },
+		request: RequestPeriod & {
+			filters?:
+				| z.input<FilterSchemaOf<Extract<M[number], { key: K }>>>
+				| undefined
+		},
 		ctx: Ctx,
 		options?: RunOptions
 	): Promise<MetricResult<OutputOfMetric<Extract<M[number], { key: K }>>>>
@@ -372,10 +427,6 @@ export type MetricRegistryOptions<
 	 */
 	onError?:
 		| ((error: unknown, failure: MetricFailure<M[number]>, ctx: Ctx) => unknown)
-		| undefined
-	/** @deprecated Use `onError`, which hears this as `code: 'shape_failed'`. */
-	onShapeError?:
-		| ((error: unknown, metric: M[number], ctx: Ctx) => unknown)
 		| undefined
 }
 
@@ -436,17 +487,16 @@ export function createMetricRegistry<
 		ctx: Ctx
 	) => {
 		try {
-			if (failure.code === 'shape_failed' && failure.metric)
-				await options.onShapeError?.(error, failure.metric, ctx)
-		} catch {}
-		try {
 			await options.onError?.(error, failure, ctx)
-		} catch {}
+		} catch {
+			// A log that fails must not fail the metric it describes.
+		}
 	}
 
 	/** The request's local days, or null for all time. */
 	const periodOf = async (
 		request: RequestPeriod,
+		timezone: string,
 		ctx: Ctx
 	): Promise<ResolvedPeriod | null> => {
 		const { period, from, to } = request
@@ -465,7 +515,6 @@ export function createMetricRegistry<
 				)
 			return null
 		}
-		const timezone = await analytics.timezone(ctx)
 		const last = to
 			? localDate(to, timezone)
 			: (await analytics.period({ preset: 'today' }, ctx))?.to
@@ -492,7 +541,7 @@ export function createMetricRegistry<
 
 		try {
 			const timezone = await analytics.timezone(ctx)
-			const period = await periodOf(request, ctx)
+			const period = await periodOf(request, timezone, ctx)
 			const granularity =
 				request.granularity ?? inferGranularity(period?.days ?? null)
 			const bucket = bucketFor(granularity)
@@ -507,8 +556,17 @@ export function createMetricRegistry<
 			}
 			const failed: Failed[] = []
 			const tasks = new Map<string, Promise<object>>()
+			// Asked up front, so every metric then starts in the same tick and the queries that
+			// count the same rows share a statement.
+			const allowed = await Promise.all(
+				request.metrics.map((requested) => {
+					const metric = byKey.get(requested.key)
+					return metric ? canRun(metric, ctx) : false
+				})
+			)
+			const batch = analytics.batch()
 
-			for (const requested of request.metrics) {
+			for (const [index, requested] of request.metrics.entries()) {
 				const requestKey = requested.requestKey ?? requested.key
 				const metric = byKey.get(requested.key)
 				const fail = (code: MetricErrorCode, message: string) => {
@@ -523,7 +581,7 @@ export function createMetricRegistry<
 					fail('unknown_metric', 'Unknown metric')
 					continue
 				}
-				if (!(await canRun(metric, ctx))) {
+				if (!allowed[index]) {
 					fail('forbidden', 'Access denied')
 					continue
 				}
@@ -541,16 +599,24 @@ export function createMetricRegistry<
 					granularity,
 					ctx
 				}
-				const metricPeriod = metric.supportsTimeRange ? period : null
+				const supportsTimeRange = metric.supportsTimeRange !== false
+				const metricPeriod = supportsTimeRange ? period : null
 				tasks.set(
 					requestKey,
-					runMetric(metric, metricRun, metricPeriod, compare, signal).then(
+					runMetric(
+						metric,
+						metricRun,
+						metricPeriod,
+						compare,
+						signal,
+						batch
+					).then(
 						(result): object => ({
 							key: metric.key,
 							requestKey,
 							result: {
 								...result,
-								supportsTimeRange: metric.supportsTimeRange,
+								supportsTimeRange,
 								period: metricPeriod
 									? {
 											from: metricPeriod.from,
@@ -603,7 +669,8 @@ export function createMetricRegistry<
 		metricRun: MetricRun<unknown, Ctx>,
 		period: ResolvedPeriod | null,
 		compare: boolean,
-		signal: AbortSignal
+		signal: AbortSignal,
+		batch: QueryBatch
 	): Promise<{ current: MetricOutput; previous?: MetricOutput }> => {
 		const withPrevious = compare && period !== null
 
@@ -626,14 +693,26 @@ export function createMetricRegistry<
 				: { current }
 		}
 
-		const result = await analytics.query(
+		const query = metric.query(metricRun)
+		const grouped = (query.groupBy?.length ?? 0) > 0
+		// A series or a grid needs every row: 20 groups would cut it short.
+		const everyRow = metric.kind === 'timeseries' || metric.kind === 'pivot'
+		// Built here, so `query` checks it when it runs: `never` skips the rules for a query
+		// written in place, which cannot be shown for a generic `DS`.
+		const result: { truncated: boolean; previous?: object } & Record<
+			string,
+			unknown
+		> = await analytics.query(
 			{
-				...metric.query(metricRun),
+				...query,
+				...(grouped && query.totals === undefined && { totals: false }),
+				...(everyRow &&
+					query.limit === undefined && { limit: analytics.maxLimit }),
 				period: period ? { from: period.from, to: period.to } : { all: true },
 				compareToPrevious: withPrevious
-			} as DatasetQuery<DS[number]>,
+			} as never,
 			metricRun.ctx,
-			{ signal, metric: metric.key }
+			{ signal, metric: metric.key, batch }
 		)
 		if (metric.kind === 'timeseries' && result.truncated) {
 			throw new MetricError(
@@ -644,9 +723,7 @@ export function createMetricRegistry<
 		}
 
 		const shape = metric.shape
-		const { previous, ...current } = result as {
-			previous?: object
-		} & Record<string, unknown>
+		const { previous, ...current } = result
 		try {
 			const output = shape(current, metricRun)
 			return previous

@@ -407,7 +407,8 @@ type EmptyOf<V> = null extends V ? null : never
 
 /**
  * Makes `expr` fail typecheck when it can produce a value `Allowed` does not list, naming the
- * missing values. Expressions typed only as `string` pass; `defineDataset` checks those.
+ * missing values. Expressions typed only as `string` pass; for a computed dimension
+ * `defineDataset` checks those.
  */
 type CoversValues<V, Allowed> =
 	string extends NonNullable<V>
@@ -485,29 +486,21 @@ function lookupOf(
 
 export const dimension = {
 	/**
-	 * A column holding one value of a closed set, such as a Prisma enum. `labels` must name
-	 * every value, so adding an enum value fails typecheck until it has a label, and a column
-	 * typed with values outside `values` fails too. A nullable column gives null keys.
+	 * A column holding one value of a closed set, such as a Prisma enum. `labels` names every
+	 * value the column's type can hold, so adding an enum value fails typecheck until it has a
+	 * label. A nullable column gives null keys.
 	 */
 	enum<
-		const E extends Record<string, string>,
 		V extends string | null,
+		const K extends string,
 		G extends boolean = boolean,
 		F extends boolean = boolean,
 		Access extends string = never
 	>(
-		expr: Expr<'string', V> & CoversValues<V, E[keyof E]>,
-		values: E,
+		expr: Expr<'string', V> & CoversValues<V, NoInfer<K>>,
 		options: DimensionOptions<G, F, Access> &
-			EmptyOption & { labels: Record<E[keyof E], string> }
-	): EnumDimension<E[keyof E], EmptyOf<V>> &
-		DimensionAccess<G, F, NoInfer<Access>> {
-		for (const value of Object.values(values)) {
-			if (!(value in options.labels)) {
-				throw new Error(`${options.label}: the value ${value} has no label`)
-			}
-		}
-
+			EmptyOption & { labels: Record<K, string> }
+	): EnumDimension<K, EmptyOf<V>> & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
 			...base(options),
 			category: 'closed',

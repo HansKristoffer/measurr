@@ -1,9 +1,13 @@
 import { describe, expect, expectTypeOf, test } from 'bun:test'
 import { z } from 'zod'
 import { postgresDialect } from './dialects/postgres.js'
-import { orderMetrics, type Role } from './fixtures/metrics.js'
+import {
+	type MetricCtx as Ctx,
+	orderMetrics,
+	type Role
+} from './fixtures/metrics.js'
 import { orderBook, orders } from './fixtures/orders.js'
-import { createAnalytics } from './index.js'
+import { type Analytics, createAnalytics } from './index.js'
 import {
 	createMetricRegistry,
 	type MetricChunk,
@@ -26,7 +30,8 @@ import type {
 	TimeSeriesOutput
 } from './shapes.js'
 
-type Ctx = { role: Role; timezone: string }
+/** What `metricDefiner` needs: the datasets and the context of an analytics instance. */
+type OrdersAnalytics<Ctx = unknown> = Analytics<readonly [typeof orders], Ctx>
 
 const DAY_MS = 86_400_000
 const TIMEZONE = 'Pacific/Auckland'
@@ -46,16 +51,24 @@ function registryWith(options: { failRegions?: boolean } = {}) {
 					statements.push({ text, values })
 					if (options.failRegions && text.includes('"g_region"'))
 						throw new Error('connection reset')
-					const start = values[2]
+					const grouped = (statement: { text: string }) =>
+						statement.text.includes('"g_')
+					// A grouped statement binds the tenant, the scope, then the period's start.
+					const start = grouped({ text }) ? values[2] : undefined
 					const timed = typeof start === 'string'
 					const previous =
-						timed && statements.some((s) => String(s.values[2]) > start)
+						timed &&
+						statements.some((s) => grouped(s) && String(s.values[2]) > start)
 					const value = previous ? 1 : 2
 					const day = timed ? localDate(new Date(start), TIMEZONE) : null
 					const row = {
 						m_orders: value,
 						m_paidShare: 0.25,
-						m_revenue: 100
+						m_revenue: 100,
+						// Read only from a statement that counts both periods at once.
+						p_orders: 1,
+						p_paidShare: 0.25,
+						p_revenue: 100
 					}
 					if (text.includes('"g_region"'))
 						return [{ ...row, g_region: 'north', g_region__label: 'North' }]
@@ -74,15 +87,15 @@ function registryWith(options: { failRegions?: boolean } = {}) {
 		tenant: () => 't1',
 		timezone: (ctx: Ctx) => ctx.timezone
 	})
-	const shapeErrors: string[] = []
+	const failures: string[] = []
 	const registry = createMetricRegistry({
 		analytics,
 		metrics: orderMetrics,
 		canRun: (metric, ctx) =>
 			!metric.allowedRoles || metric.allowedRoles.includes(ctx.role),
-		onShapeError: (_, metric) => shapeErrors.push(metric.key)
+		onError: (_, failure) => failures.push(`${failure.key}: ${failure.code}`)
 	})
-	return { registry, statements, shapeErrors }
+	return { registry, statements, failures }
 }
 
 type Registry = ReturnType<typeof registryWith>['registry']
@@ -222,7 +235,7 @@ describe('createMetricRegistry', () => {
 	})
 
 	test('access, filters and shapes fail one metric, not the request', async () => {
-		const { registry, statements, shapeErrors } = registryWith()
+		const { registry, statements, failures } = registryWith()
 		const chunks = await run(
 			registry,
 			{
@@ -279,7 +292,10 @@ describe('createMetricRegistry', () => {
 			done: expect.any(Boolean)
 		})
 		expect(chunks.at(-1)?.done).toBe(true)
-		expect(shapeErrors).toEqual([])
+		expect(failures).toEqual([
+			'orders.paidShare: forbidden',
+			'orders.count: invalid_filters'
+		])
 	})
 
 	test('an engine error carries its message; a driver error does not', async () => {
@@ -293,7 +309,7 @@ describe('createMetricRegistry', () => {
 	})
 
 	test('a shape that throws fails its metric', async () => {
-		const shapeErrors: string[] = []
+		const heard: string[] = []
 		const broken = createMetricRegistry({
 			analytics: createAnalytics({
 				datasets: [orders],
@@ -303,21 +319,19 @@ describe('createMetricRegistry', () => {
 				tenant: () => 't1'
 			}),
 			metrics: [
-				metricDefiner<typeof orders>()({
+				metricDefiner<OrdersAnalytics>()({
 					key: 'orders.broken',
 					kind: 'kpi',
 					description: 'Throws while drawing',
 					supportsTimeRange: false,
-					filterSchema: z.object({}),
 					query: () => ({ dataset: 'orders', measures: ['orders'] }),
 					shape: (result) => {
 						throw new Error(`no rows in ${result.rows.length}`)
 					}
 				})
 			],
-			onShapeError: (_, metric) => shapeErrors.push(metric.key),
 			onError: (error, failure) =>
-				shapeErrors.push(`${failure.code}: ${(error as Error).message}`)
+				heard.push(`${failure.code}: ${(error as Error).message}`)
 		})
 		const [failed] = await Array.fromAsync(
 			broken.run({ metrics: [{ key: 'orders.broken' }] }, {})
@@ -329,7 +343,7 @@ describe('createMetricRegistry', () => {
 			code: 'shape_failed',
 			done: true
 		})
-		expect(shapeErrors).toEqual(['orders.broken', 'shape_failed: no rows in 0'])
+		expect(heard).toEqual(['shape_failed: no rows in 0'])
 	})
 
 	test('lists the metrics ctx may run, and refuses duplicate keys', async () => {
@@ -407,16 +421,13 @@ describe('registry types', () => {
 
 	test('an app adds its own fields', () => {
 		const defineMetric = metricDefiner<
-			typeof orders,
-			Role,
+			OrdersAnalytics,
 			{ catalog?: { owner: string } }
 		>()
 		const metric = defineMetric({
 			key: 'orders.owned',
 			kind: 'kpi',
 			description: '',
-			supportsTimeRange: true,
-			filterSchema: z.object({}),
 			catalog: { owner: 'sales' },
 			query: () => ({ dataset: 'orders', measures: ['orders'] }),
 			shape: (result) => ({ kind: 'kpi', value: result.totals.orders })
@@ -427,26 +438,75 @@ describe('registry types', () => {
 		defineMetric({ ...metric, unknownField: true })
 	})
 
+	test('presenters take a query whose measures are picked at runtime', () => {
+		const defineMetric = metricDefiner<OrdersAnalytics>()
+		const metric = defineMetric({
+			key: 'orders.picked',
+			kind: 'timeseries',
+			description: '',
+			filterSchema: z.object({ revenue: z.boolean().optional() }),
+			query: ({ bucket, filters }) => ({
+				dataset: 'orders',
+				measures: filters.revenue ? ['orders', 'revenue'] : ['orders'],
+				groupBy: filters.revenue ? [bucket] : [bucket, 'status']
+			}),
+			shape: (result, { bucket }) => {
+				// Neither list is literal, so nothing says which keys a row holds.
+				expectTypeOf(result.rows[0]?.orders).toEqualTypeOf<number | undefined>()
+				return presentTimeseries(result, {
+					bucket,
+					measure: 'orders',
+					series: 'status'
+				})
+			}
+		})
+		expectTypeOf(metric.kind).toEqualTypeOf<'timeseries'>()
+	})
+
 	test('a query and a shape are checked against the dataset', () => {
-		const defineMetric = metricDefiner<typeof orders, Role>()
+		const defineMetric = metricDefiner<
+			OrdersAnalytics,
+			{ allowedRoles?: readonly Role[] }
+		>()
 		defineMetric({
 			key: 'orders.typo',
 			kind: 'kpi',
 			description: '',
-			supportsTimeRange: true,
 			// @ts-expect-error not a role
 			allowedRoles: ['admin'],
-			filterSchema: orderMetrics[1].filterSchema,
 			// @ts-expect-error not a measure of orders
 			query: () => ({ dataset: 'orders', measures: ['refunds'] }),
 			shape: () => ({ kind: 'kpi', value: 0 })
 		})
 		defineMetric({
+			key: 'orders.ownPeriod',
+			kind: 'kpi',
+			description: '',
+			// @ts-expect-error the registry sets the period from the request
+			query: () => ({
+				dataset: 'orders',
+				measures: ['orders'],
+				period: { last: { days: 7 } }
+			}),
+			shape: () => ({ kind: 'kpi', value: 0 })
+		})
+		defineMetric({
+			key: 'orders.wrongSort',
+			kind: 'leaderboard',
+			description: '',
+			// @ts-expect-error revenue is not one of the query's measures
+			query: () => ({
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['region'],
+				sort: { by: 'revenue' }
+			}),
+			shape: () => ({ kind: 'leaderboard', items: [] })
+		})
+		defineMetric({
 			key: 'orders.wrongKind',
 			kind: 'kpi',
 			description: '',
-			supportsTimeRange: true,
-			filterSchema: orderMetrics[1].filterSchema,
 			query: () => ({ dataset: 'orders', measures: ['orders'] }),
 			// @ts-expect-error a kpi metric draws a kpi
 			shape: () => ({ kind: 'leaderboard', items: [] })
@@ -457,13 +517,12 @@ describe('registry types', () => {
 describe('periods, resolve metrics and errors', () => {
 	type Viewer = { tenantId?: string; userId: string }
 	const NOW = new Date('2026-11-10T10:00:00Z')
-	const defineMetric = metricDefiner<typeof orders, Role, object, Viewer>()
+	const defineMetric = metricDefiner<OrdersAnalytics<Viewer>>()
 
 	const mine = defineMetric({
 		key: 'orders.mine',
 		kind: 'kpi',
 		description: 'Orders of the customer signed in',
-		supportsTimeRange: true,
 		query: ({ ctx }) => ({
 			dataset: 'orders',
 			measures: ['orders'],
@@ -475,7 +534,6 @@ describe('periods, resolve metrics and errors', () => {
 		key: 'seats.used',
 		kind: 'kpi',
 		description: 'Seats in use, from the billing database',
-		supportsTimeRange: true,
 		resolve: async ({ period, tenant, ctx }) => ({
 			kind: 'kpi',
 			value: period?.days ?? 0,
@@ -486,7 +544,6 @@ describe('periods, resolve metrics and errors', () => {
 		key: 'orders.daily',
 		kind: 'timeseries',
 		description: 'Orders per day',
-		supportsTimeRange: true,
 		query: ({ bucket }) => ({
 			dataset: 'orders',
 			measures: ['orders'],
@@ -497,7 +554,7 @@ describe('periods, resolve metrics and errors', () => {
 			presentTimeseries(result, { bucket, measure: 'orders' })
 	})
 
-	function setup(rows: Record<string, unknown>[] = []) {
+	function setup(rows: Record<string, unknown>[] = [], groupedMs = 0) {
 		const statements: { text: string; values: readonly unknown[] }[] = []
 		const signals: AbortSignal[] = []
 		const failures: [unknown, string, string][] = []
@@ -508,9 +565,12 @@ describe('periods, resolve metrics and errors', () => {
 					dialect: postgresDialect(),
 					execute: async ({ text, values }, options) => {
 						statements.push({ text, values })
-						if (options?.signal) signals.push(options.signal)
 						if (text.includes('"label"')) return [{ key: 'u1', label: 'u1' }]
-						return text.includes('"g_') ? rows : [{ m_orders: 4 }]
+						if (!text.includes('"g_')) return [{ m_orders: 4 }]
+						// Grouped statements are the ones still running when a consumer stops.
+						if (options?.signal) signals.push(options.signal)
+						if (groupedMs) await Bun.sleep(groupedMs)
+						return rows
 					}
 				}
 			},
@@ -663,17 +723,12 @@ describe('periods, resolve metrics and errors', () => {
 	})
 
 	test('a consumer that stops reading aborts the statements', async () => {
-		const { registry, signals } = setup()
+		const { registry, signals } = setup([], 20)
 		for await (const chunk of registry.run(
-			{
-				metrics: [
-					{ key: 'orders.mine' },
-					{ key: 'orders.mine', requestKey: 'again' }
-				]
-			},
+			{ metrics: [{ key: 'orders.mine' }, { key: 'orders.daily' }] },
 			viewer
 		)) {
-			expect(chunk.error).toBeUndefined()
+			expect(chunk.key).toBe('orders.mine')
 			break
 		}
 
@@ -770,6 +825,134 @@ describe('output schemas', () => {
 			).toEqual(result.current)
 		}
 		expect(MetricOutputSchema.safeParse({ kind: 'gauge' }).success).toBe(false)
+	})
+})
+
+describe('what the registry decides for a metric query', () => {
+	type Viewer = { tenantId: string }
+	const defineMetric = metricDefiner<OrdersAnalytics<Viewer>>()
+
+	const series = defineMetric({
+		key: 'orders.series',
+		kind: 'timeseries',
+		description: 'Orders per bucket',
+		query: ({ bucket }) => ({
+			dataset: 'orders',
+			measures: ['orders'],
+			groupBy: [bucket]
+		}),
+		shape: (result, { bucket }) => {
+			// @ts-expect-error a grouped metric query has no totals unless it asks for them
+			void result.totals
+			return presentTimeseries(result, { bucket, measure: 'orders' })
+		}
+	})
+	const split = defineMetric({
+		key: 'orders.split',
+		kind: 'distribution',
+		description: 'Orders by status, next to the number of orders',
+		filterSchema: z.object({ status: z.enum(['OPEN', 'PAID']).optional() }),
+		query: ({ filters }) => ({
+			dataset: 'orders',
+			measures: ['orders'],
+			groupBy: ['status'],
+			filters: [
+				filters.status && {
+					dimension: 'status',
+					op: 'in',
+					values: [filters.status]
+				}
+			],
+			totals: true
+		}),
+		shape: (result) => ({
+			kind: 'distribution',
+			total: result.totals.orders,
+			segments: []
+		})
+	})
+	const total = defineMetric({
+		key: 'orders.total',
+		kind: 'kpi',
+		description: 'Orders',
+		query: () => ({ dataset: 'orders', measures: ['orders'] }),
+		shape: (result) => ({ kind: 'kpi', value: result.totals.orders })
+	})
+
+	function setup() {
+		const statements: string[] = []
+		const registry = createMetricRegistry({
+			analytics: createAnalytics({
+				datasets: [orders],
+				sources: {
+					main: {
+						dialect: postgresDialect(),
+						execute: async ({ text }) => {
+							statements.push(text)
+							return text.includes('"g_') ? [] : [{ m_orders: 4, p_orders: 3 }]
+						}
+					}
+				},
+				tenant: (ctx: Viewer) => ctx.tenantId,
+				maxLimit: 500
+			}),
+			metrics: [series, split, total] as const
+		})
+		return { registry, statements }
+	}
+	const viewer: Viewer = { tenantId: 't1' }
+	const compared = {
+		period: { last: { days: 7 } },
+		compareToPrevious: true
+	} as const
+
+	test('a grouped query runs without totals unless it asks for them', async () => {
+		const { registry, statements } = setup()
+
+		await registry.one('orders.series', compared, viewer)
+		// The rows of each period.
+		expect(statements).toHaveLength(2)
+
+		const result = await registry.one('orders.split', compared, viewer)
+		// The rows of each period, and one totals statement for both.
+		expect(statements).toHaveLength(5)
+		expect(result.current.total).toBe(4)
+		expect(result.previous?.total).toBe(3)
+	})
+
+	test('a series asks for every row the instance allows; other kinds keep the default', async () => {
+		const { registry, statements } = setup()
+
+		await registry.one('orders.series', {}, viewer)
+		await registry.one('orders.split', {}, viewer)
+
+		expect(statements[0]).toContain('LIMIT 501')
+		expect(statements[1]).toContain('LIMIT 21')
+	})
+
+	test('a number compared with the previous period is one statement', async () => {
+		const { registry, statements } = setup()
+
+		const result = await registry.one('orders.total', compared, viewer)
+
+		expect(statements).toHaveLength(1)
+		expect(result.current).toEqual({ kind: 'kpi', value: 4 })
+		expect(result.previous).toEqual({ kind: 'kpi', value: 3 })
+	})
+
+	test('one takes the filters its metric accepts', async () => {
+		const { registry, statements } = setup()
+
+		await registry.one('orders.split', { filters: { status: 'PAID' } }, viewer)
+		expect(statements[0]).toContain('"orders"."status" IN')
+
+		const typeOnly = () => {
+			// @ts-expect-error not a status the metric filters by
+			registry.one('orders.split', { filters: { status: 'LOST' } }, viewer)
+			// @ts-expect-error the metric takes no filters
+			registry.one('orders.total', { filters: { status: 'PAID' } }, viewer)
+		}
+		void typeOnly
 	})
 })
 

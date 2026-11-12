@@ -6,6 +6,7 @@
 import { bucketStarts } from './period.js'
 import type { ResultFields, ResultPeriod } from './query.js'
 
+type BucketUnit = 'day' | 'week' | 'month'
 type DimensionValue = { key: string | number | null; label: string }
 type Measures = Record<string, number | null>
 type Key = string | number | null
@@ -25,11 +26,16 @@ type AnyResult = {
 }
 
 type RowOf<R extends AnyResult> = R['rows'][number]
-/** The measures: the totals' keys, or the row keys that hold numbers when there are none. */
+/**
+ * The measures: the totals' keys, or the row keys that hold numbers when there are none. A
+ * key the query may not have asked for (a list of measures built at runtime) counts too.
+ */
 type MeasureOf<R extends AnyResult> = R extends { totals: infer T }
 	? keyof T & string
 	: {
-			[K in keyof RowOf<R> & string]: RowOf<R>[K] extends number | null
+			[K in keyof RowOf<R> & string]-?: [NonNullable<RowOf<R>[K]>] extends [
+				number
+			]
 				? K
 				: never
 		}[keyof RowOf<R> & string]
@@ -61,7 +67,7 @@ export type SeriesPoint = {
 
 export type TimeseriesShape = {
 	kind: 'timeseries'
-	unit: 'day' | 'week' | 'month'
+	unit: BucketUnit
 	series: {
 		key: string | number | null
 		label: string
@@ -142,8 +148,13 @@ export function toKpi<R extends AnyResult>(
 export function toTimeseries<R extends AnyResult>(
 	result: R,
 	options: {
+		/** The time-bucket dimension the query grouped by. */
 		bucket: DimensionOf<R>
-		unit: 'day' | 'week' | 'month'
+		/**
+		 * What one bucket is. Read from the result's `fields` when omitted; only a result built
+		 * by hand, without `fields`, needs it.
+		 */
+		unit?: BucketUnit | undefined
 		measure: MeasureOf<R>
 		series?: DimensionOf<R> | undefined
 		/** Series to draw even without rows (zero lanes), first. */
@@ -151,7 +162,8 @@ export function toTimeseries<R extends AnyResult>(
 		fill?: number | null
 	}
 ): TimeseriesShape {
-	const { bucket, unit, measure, series } = options
+	const { bucket, measure, series } = options
+	const unit = bucketUnit(result, bucket, options.unit)
 	const fill = options.fill === undefined ? 0 : options.fill
 	const seriesOf = (row: Record<string, unknown>) =>
 		series ? dimensionValue(row, series) : { key: measure, label: measure }
@@ -313,6 +325,22 @@ export function toLeaderboard<R extends AnyResult>(
 		})),
 		truncated: result.truncated
 	}
+}
+
+/** What one bucket of the grouped dimension `bucket` is: `unit`, or what `fields` says. */
+function bucketUnit(
+	result: AnyResult,
+	bucket: string,
+	unit: BucketUnit | undefined
+): BucketUnit {
+	const known =
+		unit ?? result.fields?.groupBy.find((field) => field.key === bucket)?.unit
+	if (known) return known
+	// A result from before `fields`: a dimension named after its unit says enough.
+	if (bucket === 'day' || bucket === 'week' || bucket === 'month') return bucket
+	throw new Error(
+		`${bucket} is not a time bucket the result describes; pass its unit`
+	)
 }
 
 function dimensionValue(
@@ -608,7 +636,8 @@ export function presentKpi<R extends AnyResult>(
 export function presentTimeseries<R extends AnyResult>(
 	result: R,
 	options: {
-		bucket: DimensionOf<R> & ('day' | 'week' | 'month')
+		/** The time-bucket dimension the query grouped by, whatever it is called. */
+		bucket: DimensionOf<R>
 		measure: MeasureOf<R>
 		/** The dimension each series is; one series named after the measure without it. */
 		series?: DimensionOf<R> | undefined
@@ -623,7 +652,6 @@ export function presentTimeseries<R extends AnyResult>(
 ): TimeSeriesOutput {
 	const shape = toTimeseries(result, {
 		bucket: options.bucket,
-		unit: options.bucket,
 		measure: options.measure,
 		series: options.series,
 		seriesKeys: options.seriesKeys
@@ -631,7 +659,7 @@ export function presentTimeseries<R extends AnyResult>(
 
 	return {
 		kind: 'timeseries',
-		granularity: options.bucket,
+		granularity: shape.unit,
 		series: shape.series.map((series) => {
 			const key = rename(options.keys, series.key)
 			return {

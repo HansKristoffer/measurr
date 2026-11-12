@@ -352,9 +352,10 @@ export async function checkMetricContract<Ctx>(
 		const { current, previous } = chunk.result
 		if (current.kind !== metric.kind)
 			return fail(`drew a ${current.kind}, not a ${metric.kind}`)
-		if (metric.supportsTimeRange && previous?.kind !== metric.kind)
+		const snapshot = metric.supportsTimeRange === false
+		if (!snapshot && previous?.kind !== metric.kind)
 			return fail('has no previous period of its kind')
-		if (!metric.supportsTimeRange && previous)
+		if (snapshot && previous)
 			return fail('is a snapshot but has a previous period')
 		return { name, ok: true, message: undefined }
 	})

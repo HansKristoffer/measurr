@@ -77,21 +77,21 @@ describe('access-aware catalog', () => {
 		])
 	})
 
-	test('querySchema({ ctx }) is the memoized schema for the allowed datasets', async () => {
-		const schema = await analytics.querySchema({ ctx })
+	test('querySchemaFor(ctx) is the memoized schema for the allowed datasets', async () => {
+		const schema = await analytics.querySchemaFor(ctx)
 
 		expect(schema).toBe(analytics.querySchema({ datasets: ['orders'] }))
 		expect(
 			schema.safeParse({ dataset: 'refunds', measures: ['refunds'] }).success
 		).toBe(false)
 		expect(
-			await analytics.querySchema({ ctx: { ...ctx, canSeeRefunds: true } })
+			await analytics.querySchemaFor({ ...ctx, canSeeRefunds: true })
 		).toBe(analytics.querySchema())
 	})
 
-	test('querySchema({ ctx }) refuses a context that may see nothing', async () => {
+	test('querySchemaFor(ctx) refuses a context that may see nothing', async () => {
 		await expect(
-			analytics.querySchema({ ctx: { ...ctx, seesNothing: true } })
+			analytics.querySchemaFor({ ...ctx, seesNothing: true })
 		).rejects.toMatchObject({ code: 'forbidden' })
 	})
 })
@@ -125,10 +125,10 @@ describe('datasets without a tenant column', () => {
 		expect(await keys('org-1')).toEqual(['orders'])
 		expect(await keys([])).toEqual(['orders'])
 		expect(await keys(allTenants)).toEqual(['orders', 'maintenance'])
-		expect(await analytics.querySchema({ ctx: { tenant: 'org-1' } })).toBe(
+		expect(await analytics.querySchemaFor({ tenant: 'org-1' })).toBe(
 			analytics.querySchema({ datasets: ['orders'] })
 		)
-		expect(await analytics.querySchema({ ctx: everyTenant })).toBe(
+		expect(await analytics.querySchemaFor(everyTenant)).toBe(
 			analytics.querySchema()
 		)
 	})
@@ -190,9 +190,32 @@ describe('field access', () => {
 		expect(() => createAnalytics(options)).toThrow(/no authorizeField/)
 	})
 
+	test('authorizeField is asked only about the marked fields a query names', async () => {
+		const asked: string[] = []
+		const counting = createAnalytics({
+			...options,
+			authorizeField: (_dataset, key, _access, _viewer: Viewer) => {
+				asked.push(key)
+				return true
+			}
+		})
+
+		await counting.query(
+			{ dataset: 'sales', measures: ['orders'], groupBy: ['status'] },
+			customer
+		)
+		expect(asked).toEqual([])
+
+		await counting.query(
+			{ dataset: 'sales', measures: ['marginRate'] },
+			customer
+		)
+		expect(asked).toEqual(['marginRate'])
+	})
+
 	test('the catalog and schema for a caller leave out what it may not use', async () => {
 		const [entry] = await analytics.listDatasets(customer)
-		const schema = await analytics.querySchema({ ctx: customer })
+		const schema = await analytics.querySchemaFor(customer)
 		const parses = (query: object) =>
 			schema.safeParse({ dataset: 'sales', ...query }).success
 
@@ -207,13 +230,11 @@ describe('field access', () => {
 		expect(parses({ measures: ['margin'] })).toBe(false)
 		expect(parses({ measures: ['marginRate'] })).toBe(false)
 		expect(parses({ measures: ['orders'], groupBy: ['customer'] })).toBe(false)
-		expect(await analytics.querySchema({ ctx: customer })).toBe(schema)
+		expect(await analytics.querySchemaFor(customer)).toBe(schema)
 
 		const [full] = await analytics.listDatasets(staff)
 		expect(full?.measures).toHaveLength(4)
-		expect(await analytics.querySchema({ ctx: staff })).toBe(
-			analytics.querySchema()
-		)
+		expect(await analytics.querySchemaFor(staff)).toBe(analytics.querySchema())
 	})
 
 	test('every query checks again, ratios included', async () => {
@@ -275,9 +296,9 @@ describe('field access', () => {
 		})
 
 		expect(await onlyMargins.listDatasets(customer)).toEqual([])
-		await expect(
-			onlyMargins.querySchema({ ctx: customer })
-		).rejects.toMatchObject({ code: 'forbidden' })
+		await expect(onlyMargins.querySchemaFor(customer)).rejects.toMatchObject({
+			code: 'forbidden'
+		})
 	})
 })
 
@@ -602,7 +623,8 @@ describe('query options', () => {
 						await options.execute?.(execution?.signal)
 						return text.includes('"g_')
 							? (options.rows ?? [])
-							: [{ m_orders: 3 }]
+							: // `p_orders` is read only from a statement that counts both periods.
+								[{ m_orders: 3, p_orders: 1 }]
 					}
 				}
 			},
@@ -636,6 +658,103 @@ describe('query options', () => {
 		expect(result.rows[0]?.orders).toBe(2)
 		// @ts-expect-error a result without totals says so in its type
 		void result.totals
+	})
+
+	test('a comparison that does not group reads both periods in one statement', async () => {
+		const { analytics, statements } = recording()
+
+		const result = await analytics.query(
+			{ dataset: 'orders', measures: ['orders'], compareToPrevious: true },
+			ctx
+		)
+
+		expect(statements).toHaveLength(1)
+		expect(result.totals).toEqual({ orders: 3 })
+		expect(result.previous.totals).toEqual({ orders: 1 })
+		expect(result.previous.rows).toEqual([{ orders: 1 }])
+	})
+
+	test('a grouped comparison reads the totals of both periods in one statement', async () => {
+		const { analytics, statements } = recording({
+			rows: [{ g_status: 'PAID', m_orders: 2 }]
+		})
+
+		const result = await analytics.query(
+			{ ...byStatus, compareToPrevious: true },
+			ctx
+		)
+
+		expect(statements).toHaveLength(3)
+		expect(result.totals).toEqual({ orders: 3 })
+		expect(result.previous.totals).toEqual({ orders: 1 })
+	})
+
+	test('falsy filters are skipped, so a filter can be conditional', async () => {
+		const { analytics, statements } = recording()
+		const ordersWith = (status?: 'OPEN' | 'PAID') =>
+			analytics.query(
+				{
+					dataset: 'orders',
+					measures: ['orders'],
+					filters: [
+						status && { dimension: 'status', op: 'in', values: [status] },
+						null,
+						false
+					]
+				},
+				ctx
+			)
+
+		await ordersWith()
+		await ordersWith('PAID')
+
+		expect(statements[0]).not.toContain('"status"')
+		expect(statements[1]).toContain('"orders"."status" IN')
+		// A model is not offered the shortcut.
+		expect(
+			analytics.querySchema().safeParse({
+				dataset: 'orders',
+				measures: ['orders'],
+				filters: [null]
+			}).success
+		).toBe(false)
+	})
+
+	test('label lookups for several filters run at once', async () => {
+		let running = 0
+		let most = 0
+		const analytics = createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text }) => {
+						if (!text.includes('AS "label"')) return [{ m_orders: 1 }]
+						most = Math.max(most, ++running)
+						await Bun.sleep(5)
+						running--
+						return text.includes('"tags"')
+							? [{ key: 't1', label: 'Complaint' }]
+							: [{ key: 'north', label: 'North' }]
+					}
+				}
+			},
+			tenant: (ctx: Ctx) => ctx.tenantId
+		})
+
+		await analytics.query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				filters: [
+					{ dimension: 'region', op: 'in', values: ['North'] },
+					{ dimension: 'tag', op: 'in', values: ['Complaint'] }
+				]
+			},
+			ctx
+		)
+
+		expect(most).toBe(2)
 	})
 
 	test('totals stay the default, and models are not offered the option', async () => {
@@ -719,7 +838,8 @@ describe('query options', () => {
 			)
 		)
 
-		expect(statements).toHaveLength(12)
+		// Per query: the rows of each period, and one totals statement for both.
+		expect(statements).toHaveLength(9)
 		expect(most).toBe(2)
 	})
 

@@ -97,7 +97,7 @@ export const orders = defineDataset({
 		refundRate: measure.ratio('refunded', 'orders', { label: 'Refund rate' })
 	},
 	dimensions: {
-		status: dimension.enum(order.col('status'), OrderStatus, {
+		status: dimension.enum(order.col('status'), {
 			label: 'Status',
 			labels: STATUS_LABELS
 		}),
@@ -149,7 +149,7 @@ export const orderBook = defineDataset({
 	defaultPeriod: { all: true },
 	measures: { orders: measure.count({ label: 'Orders' }) },
 	dimensions: {
-		status: dimension.enum(order.col('status'), OrderStatus, {
+		status: dimension.enum(order.col('status'), {
 			label: 'Status',
 			labels: STATUS_LABELS
 		}),
@@ -182,7 +182,7 @@ export const sales = defineDataset({
 		marginRate: measure.ratio('margin', 'revenue', { label: 'Margin rate' })
 	},
 	dimensions: {
-		status: dimension.enum(order.col('status'), OrderStatus, {
+		status: dimension.enum(order.col('status'), {
 			label: 'Status',
 			labels: STATUS_LABELS
 		}),
@@ -220,11 +220,10 @@ export const maintenance = defineDataset({
 		cost: measure.sum(maintenanceCase.col('cost'), { label: 'Cost' })
 	},
 	dimensions: {
-		kind: dimension.enum(
-			maintenanceCase.col('kind'),
-			{ REPAIR: 'REPAIR', SERVICE: 'SERVICE' } as const,
-			{ label: 'Kind', labels: { REPAIR: 'Repair', SERVICE: 'Service' } }
-		),
+		kind: dimension.enum(maintenanceCase.col('kind'), {
+			label: 'Kind',
+			labels: { REPAIR: 'Repair', SERVICE: 'Service' }
+		}),
 		technician: dimension.relation({
 			label: 'Technician',
 			key: maintenanceCase.col('technician'),

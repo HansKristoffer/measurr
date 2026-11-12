@@ -37,7 +37,9 @@ type Queries<DS extends readonly AnyDataset[]> = Record<
 
 /**
  * Runs named queries in parallel. One query failing does not fail the others: its error is
- * under its name. Each query is authorized, cached and reported like a single `query`.
+ * under its name. Each query is authorized, cached and reported like a single `query`; those
+ * that count the same rows without grouping (the same dataset, filters, period and tenant
+ * scope) share one statement.
  */
 export async function queryBatch<
 	DS extends readonly AnyDataset[],
@@ -84,12 +86,17 @@ export async function* streamBatch<
 		: controller.signal
 
 	try {
+		const batch = analytics.batch()
 		const pending = new Map(
 			Object.entries(queries).map(([key, query]) => {
-				const settled = analytics.query(query, ctx, { signal }).then(
-					(result) => ({ key, result }),
-					(error: unknown) => ({ key, error: batchError(error) })
-				)
+				// `never` skips the rules for a query written in place, which cannot be shown for a
+				// generic `DS`; `query` checks every query when it runs.
+				const settled = analytics
+					.query(query as never, ctx, { signal, batch })
+					.then(
+						(result) => ({ key, result }),
+						(error: unknown) => ({ key, error: batchError(error) })
+					)
 				return [key, settled] as const
 			})
 		)

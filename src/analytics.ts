@@ -17,12 +17,16 @@ import {
 	type Tenant,
 	type TenantId,
 	allTenants,
+	isOnePass,
 	normalizeQuery,
+	planComparison,
 	planLookup,
 	planQuery,
+	previousRow,
 	resultNotes,
 	shapeMeasures,
-	shapeRows
+	shapeRows,
+	sqlMeasures
 } from './plan.js'
 import {
 	type PeriodInput,
@@ -35,14 +39,18 @@ import {
 import {
 	type DatasetQuery,
 	type QueryResult,
+	type QueryRules,
 	type ResultFields,
 	type ResultOf,
 	type ResultPeriod,
 	type ResultWithoutTotals,
+	MAX_LIMIT,
 	buildQuerySchema,
 	datasetResultSchema,
 	periodSchema
 } from './query.js'
+
+import { type Shared, StatementBatch, share } from './share.js'
 
 export type Row = Record<string, unknown>
 
@@ -65,7 +73,22 @@ export type QueryOptions = {
 	signal?: AbortSignal | undefined
 	/** The metric the query runs for; `onQuery` and the cache hear it. */
 	metric?: string | undefined
+	/**
+	 * Queries started together with the same batch share statements: those that count the same
+	 * rows without grouping (the same dataset, filters, period and tenant scope) are read once,
+	 * with the counts, sums and averages of all of them. From `analytics.batch()`.
+	 */
+	batch?: QueryBatch | undefined
 }
+
+declare const batchBrand: unique symbol
+
+/**
+ * Queries that run together and share statements. `queryBatch`, `streamBatch` and the metric
+ * registry make one per call; make your own with `analytics.batch()` for queries you start
+ * yourself, and start them in the same tick.
+ */
+export type QueryBatch = { readonly [batchBrand]: true }
 
 export type AnalyticsErrorCode =
 	| 'invalid_query'
@@ -338,13 +361,23 @@ export type DatasetCatalogEntry<Key extends string = string> = {
 
 export type Analytics<DS extends readonly AnyDataset[], Ctx> = {
 	readonly datasets: DS
+	/** The highest `limit` a query may ask for: the `maxLimit` option, or 100. */
+	readonly maxLimit: number
 	/** Parses, authorizes, plans, compiles, runs and shapes one query. */
-	query<const Q extends DatasetQuery<DS[number]>>(
+	query<const Q extends QueryRules<DS[number], Q> & DatasetQuery<DS[number]>>(
 		input: Q,
 		ctx: Ctx,
 		options?: QueryOptions
 	): Promise<ResultOf<DS[number], Q>>
-	/** The compiled statements a query would run, without running them or resolving labels. */
+	/**
+	 * A batch for queries that run together: pass it to each `query` as `{ batch }`. Queries of
+	 * a batch that count the same rows without grouping share one statement.
+	 */
+	batch(): QueryBatch
+	/**
+	 * The compiled statements a query would run on its own, without running them or resolving
+	 * labels.
+	 */
 	explain(
 		input: DatasetQuery<DS[number]>,
 		ctx: Ctx
@@ -361,9 +394,7 @@ export type Analytics<DS extends readonly AnyDataset[], Ctx> = {
 	 * The input schema for the datasets `ctx` may query, without the fields `authorizeField`
 	 * refuses it, for a tool built per caller. Rejects with `forbidden` when none are allowed.
 	 */
-	querySchema(options: {
-		ctx: Ctx
-	}): Promise<z.ZodType<DatasetQuery<DS[number]>>>
+	querySchemaFor(ctx: Ctx): Promise<z.ZodType<DatasetQuery<DS[number]>>>
 	/** The result schema for one dataset. */
 	resultSchema(dataset: DS[number]['key']): z.ZodType<QueryResult<Row, Row>>
 	/**
@@ -385,8 +416,20 @@ export type Analytics<DS extends readonly AnyDataset[], Ctx> = {
 	listDatasets(ctx: Ctx): Promise<DatasetCatalogEntry<DS[number]['key']>[]>
 }
 
-export type AnalyticsQuery<A> =
-	A extends Analytics<infer DS, never> ? DatasetQuery<DS[number]> : never
+/**
+ * The queries an analytics instance takes. Give it the query's own type as `Q` in a function
+ * that passes its generic query on to `query`, so the rules for a query written in place
+ * (`QueryRules`) hold there too:
+ *
+ * ```ts
+ * const run = <const Q extends AnalyticsQuery<typeof analytics, Q>>(input: Q, ctx: Ctx) =>
+ * 	analytics.query(input, ctx)
+ * ```
+ */
+export type AnalyticsQuery<A, Q = unknown> =
+	A extends Analytics<infer DS, never>
+		? DatasetQuery<DS[number]> & QueryRules<DS[number], Q>
+		: never
 
 export type AnalyticsResult<A, Q> =
 	A extends Analytics<infer DS, never> ? ResultOf<DS[number], Q> : never
@@ -493,11 +536,9 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	const now = options.now ?? (() => new Date())
 	const querySchemas = new Map<string, z.ZodType>()
 	const resultSchemas = new Map<string, z.ZodType>()
+	const maxLimit = options.maxLimit ?? MAX_LIMIT
 	// What `query` parses: every dataset, the app-only fields, and the app's `maxLimit`.
-	const parseSchema = buildQuerySchema(datasets, {
-		parse: true,
-		maxLimit: options.maxLimit
-	})
+	const parseSchema = buildQuerySchema(datasets, { parse: true, maxLimit })
 	const limiters = new Map<AnalyticsSource, Acquire>()
 	if (options.concurrency !== undefined) {
 		for (const source of new Set(Object.values(options.sources)))
@@ -505,6 +546,13 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	}
 	/** Runs in flight by cache key, so identical queries at the same time share one run. */
 	const inFlight = new Map<string, Shared<ShapedResult>>()
+	/** The batches this instance made: a statement is only shared between its own queries. */
+	const batches = new WeakSet<object>()
+	const batchOf = (batch: QueryBatch | undefined) => {
+		if (batch && !batches.has(batch))
+			throw new Error('The batch was made by another analytics instance')
+		return batch as StatementBatch<readonly Row[]> | undefined
+	}
 
 	/** Runs one statement within the source's concurrency, unless `signal` has aborted. */
 	const execute = async (
@@ -538,7 +586,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	}
 
 	/** One schema per set of datasets (or views of them without some fields). */
-	const querySchemaFor = (selected: readonly AnyDataset[]) => {
+	const schemaFor = (selected: readonly AnyDataset[]) => {
 		const keyOf = (dataset: AnyDataset) => {
 			if (byKey.get(dataset.key) === dataset) return dataset.key
 
@@ -567,12 +615,12 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		return schema
 	}
 
-	/** The marked fields of `dataset` that `ctx` may not use. */
+	/** Those of `restricted` (every marked field of `dataset` by default) `ctx` may not use. */
 	const deniedFields = async (
 		dataset: AnyDataset,
-		ctx: Ctx
+		ctx: Ctx,
+		restricted = restrictedOf.get(dataset.key) ?? []
 	): Promise<RestrictedField[]> => {
-		const restricted = restrictedOf.get(dataset.key) ?? []
 		// Keys and access marks are read from the datasets themselves, so they fit the hook.
 		const authorizeField = options.authorizeField as
 			| ((
@@ -615,14 +663,6 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			})
 		)
 		return views.filter((view) => view !== null)
-	}
-
-	const querySchemaForCtx = async (ctx: Ctx) => {
-		const allowed = await allowedDatasets(ctx)
-		if (allowed.length === 0) {
-			throw new AnalyticsError('forbidden', 'No dataset is allowed')
-		}
-		return querySchemaFor(allowed)
 	}
 
 	const scopeOf = (ctx: Ctx): Tenant => {
@@ -699,11 +739,13 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			...(parsedQuery.groupBy ?? []),
 			...(parsedQuery.filters ?? []).map((filter) => filter.dimension)
 		]
-		const refused = (await deniedFields(dataset, ctx)).filter((field) =>
+		// Only the marked fields the query names: the hook may be a database lookup.
+		const marked = (restrictedOf.get(dataset.key) ?? []).filter((field) =>
 			field.kind === 'measure'
 				? parsedQuery.measures.includes(field.key)
 				: dimensionsUsed.includes(field.key)
 		)
+		const refused = await deniedFields(dataset, ctx, marked)
 		if (refused.length > 0) {
 			const names = refused.map((field) => `${field.kind} ${field.key}`)
 			throw new AnalyticsError(
@@ -732,10 +774,15 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		return { dataset, query, tenant, timezone, period, previous, now: at }
 	}
 
+	/**
+	 * Runs a prepared query. Without label lookups its statements start (or join `batch`)
+	 * before the first await, which is what lets a batch know when every query has arrived.
+	 */
 	const runQuery = async (
 		prepared: Prepared,
 		ctx: Ctx,
-		signal: AbortSignal | undefined
+		signal: AbortSignal | undefined,
+		batch: StatementBatch<readonly Row[]> | undefined
 	): Promise<ShapedResult> => {
 		const { dataset, query, tenant, timezone, period, previous, now } = prepared
 		const source = sourceFor(dataset)
@@ -743,30 +790,62 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		const run = (statement: SelectStatement) =>
 			execute(source, dialect.compile(statement), signal)
 
-		const resolvedValues = await resolveOpenValues(
+		const open = openFilters(dataset, query)
+		const resolvedValues =
+			open.length > 0
+				? await resolveOpenValues(dataset, open, tenant, now, run, dialect)
+				: new Map<string, (string | number)[]>()
+		const filters = resolvedFilters(query, resolvedValues)
+		const { rows: rowStatements, ungrouped } = queryStatements(
 			dataset,
 			query,
-			tenant,
-			now,
-			run,
-			dialect
+			{ tenant, timezone, period, now, resolvedValues },
+			previous
 		)
+		const measures = sqlMeasures(dataset, query.measures)
+		// Measures that cost as much shared as alone keep a statement, and a connection, of
+		// their own.
+		const shares =
+			batch && measures.every((key) => isOnePass(dataset, key)) ? batch : null
+		const [rowSets, counted] = await Promise.all([
+			Promise.all(rowStatements.map(run)),
+			ungrouped &&
+				(shares
+					? shares.statement(statementKey(prepared, filters), {
+							measures,
+							// In definition order whichever query came first, so the text is stable.
+							together: (all, shared) =>
+								execute(
+									source,
+									dialect.compile(
+										ungrouped(
+											Object.keys(dataset.measures).filter((key) =>
+												all.includes(key)
+											)
+										)
+									),
+									shared
+								),
+							alone: () => run(ungrouped(measures)),
+							signal
+						})
+					: run(ungrouped(measures)))
+		])
+		const grouped = query.groupBy.length > 0
+		const currentRows = (grouped ? rowSets[0] : counted) ?? []
+		// A comparison that does not group reads both periods in one statement.
+		const previousRows = grouped
+			? (rowSets[1] ?? [])
+			: currentRows.map(previousRow)
+		const totalsRow = grouped ? counted?.[0] : undefined
 
 		const range = ({ from, to }: ResolvedPeriod) => ({ from, to, timezone })
 
-		const runPeriod = async (target: ResolvedPeriod | null) => {
-			const statements = periodStatements(dataset, query, {
-				tenant,
-				timezone,
-				period: target,
-				now,
-				resolvedValues
-			})
-			const [rawRows, rawTotals] = await Promise.all([
-				run(statements.rows),
-				statements.totals ? run(statements.totals) : null
-			])
-
+		const shapePeriod = async (
+			target: ResolvedPeriod | null,
+			rawRows: readonly Row[],
+			rawTotals: Row | undefined
+		) => {
 			const { rows, kept, truncated } = shapeRows(
 				dataset,
 				query,
@@ -774,9 +853,8 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				dialect
 			)
 			// Without a totals statement, a grouped query's totals stay empty (and unreturned).
-			const grouped = query.groupBy.length > 0
-			const totalsRow = (rawTotals ?? (grouped ? [] : rawRows))[0] ?? {}
-			const totals = shapeMeasures(dataset, query.measures, totalsRow, dialect)
+			const totalsOf = rawTotals ?? (grouped ? {} : (rawRows[0] ?? {}))
+			const totals = shapeMeasures(dataset, query.measures, totalsOf, dialect)
 
 			for (const key of query.measures) {
 				const entry: AnyMeasure | undefined = dataset.measures[key]
@@ -794,14 +872,9 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 						),
 						values: used(raw)
 					})),
-					totals: used(totalsRow),
+					totals: used(totalsOf),
 					groupBy: query.groupBy,
-					filters: query.filters.map((filter) => {
-						const resolved = resolvedValues.get(filter.dimension)
-						return resolved && 'values' in filter
-							? { ...filter, values: [...resolved] }
-							: filter
-					}),
+					filters,
 					period: target ? range(target) : { all: true, timezone },
 					tenant,
 					ctx
@@ -827,9 +900,13 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		}
 
 		const [current, before] = await Promise.all([
-			runPeriod(period),
+			shapePeriod(period, currentRows, totalsRow),
 			previous &&
-				runPeriod(previous).then(({ rows, totals }) => ({
+				shapePeriod(
+					previous,
+					previousRows,
+					totalsRow && previousRow(totalsRow)
+				).then(({ rows, totals }) => ({
 					period: range(previous),
 					rows,
 					...(totals && { totals })
@@ -896,9 +973,12 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		const dataset = datasetKeyOf(input)
 		const durationMs = () => Math.round(performance.now() - startedAt)
 		let cache: AnalyticsQueryEvent['cache']
+		let arrive: (() => void) | undefined
 
 		try {
 			signal?.throwIfAborted()
+			const batch = batchOf(queryOptions.batch)
+			arrive = batch?.join()
 			const prepared = await prepare(input, ctx)
 			const entry: CacheEntry<Ctx> = {
 				dataset: prepared.dataset.key,
@@ -913,18 +993,21 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			let result = key ? await cachedResult(key, entry) : null
 			if (key) cache = result ? 'hit' : 'miss'
 			if (!result) {
-				result = key
-					? await share(
+				const running = key
+					? share(
 							inFlight,
 							key,
 							async (shared) => {
-								const fresh = await runQuery(prepared, ctx, shared)
+								const fresh = await runQuery(prepared, ctx, shared, batch)
 								store(key, fresh, entry)
 								return fresh
 							},
 							signal
 						)
-					: await runQuery(prepared, ctx, signal)
+					: runQuery(prepared, ctx, signal, batch)
+				// Its statements are with the batch by now, or come after its label lookups.
+				arrive?.()
+				result = await running
 			}
 
 			report(
@@ -956,6 +1039,9 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				ctx
 			)
 			throw error
+		} finally {
+			// A query that failed or was answered by the cache adds no statement.
+			arrive?.()
 		}
 	}
 
@@ -966,35 +1052,39 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		const { dataset, query, tenant, timezone, period, previous, now } =
 			await prepare(input, ctx)
 		const { dialect } = sourceFor(dataset)
-		const compiled: CompiledStatement[] = []
+		const { rows, ungrouped } = queryStatements(
+			dataset,
+			query,
+			{ tenant, timezone, period, now, resolvedValues: new Map() },
+			previous
+		)
+		const measures = sqlMeasures(dataset, query.measures)
 
-		for (const target of previous ? [period, previous] : [period]) {
-			const statements = periodStatements(dataset, query, {
-				tenant,
-				timezone,
-				period: target,
-				now,
-				resolvedValues: new Map()
-			})
-			compiled.push(dialect.compile(statements.rows))
-			if (statements.totals) compiled.push(dialect.compile(statements.totals))
-		}
-
-		return compiled
+		return [...rows, ...(ungrouped ? [ungrouped(measures)] : [])].map(
+			dialect.compile
+		)
 	}
 
 	return {
 		datasets: options.datasets,
 		query: query as Analytics<DS, Ctx>['query'],
+		batch: () => {
+			const batch = new StatementBatch<readonly Row[]>()
+			batches.add(batch)
+			return batch as unknown as QueryBatch
+		},
 		explain,
-		querySchema: ((
-			schemaOptions?: { datasets?: readonly string[] } | { ctx: Ctx }
-		) =>
-			schemaOptions && 'ctx' in schemaOptions
-				? querySchemaForCtx(schemaOptions.ctx)
-				: querySchemaFor(
-						schemaOptions?.datasets?.map(datasetOf) ?? datasets
-					)) as Analytics<DS, Ctx>['querySchema'],
+		maxLimit,
+		querySchema: ((schemaOptions?: { datasets?: readonly string[] }) =>
+			schemaFor(
+				schemaOptions?.datasets?.map(datasetOf) ?? datasets
+			)) as Analytics<DS, Ctx>['querySchema'],
+		querySchemaFor: async (ctx) => {
+			const allowed = await allowedDatasets(ctx)
+			if (allowed.length === 0)
+				throw new AnalyticsError('forbidden', 'No dataset is allowed')
+			return schemaFor(allowed) as z.ZodType<DatasetQuery<DS[number]>>
+		},
 		resultSchema: (key) =>
 			resultSchemaFor(key) as z.ZodType<QueryResult<Row, Row>>,
 		timezone: timezoneOf,
@@ -1019,22 +1109,59 @@ async function cacheKey(
 	const { dataset, query, tenant, timezone, period, previous } = prepared
 	const days = (target: ResolvedPeriod | null) =>
 		target && [target.from, target.to]
-	const scope =
-		tenant === allTenants
-			? { all: true }
-			: Array.isArray(tenant)
-				? [...new Set(tenant.map((id) => JSON.stringify(id)))].sort()
-				: tenant
 	const text = stableJson({
 		definition: fingerprint,
 		query,
-		tenant: scope,
+		tenant: scopeKey(tenant),
 		timezone,
 		period: days(period),
 		previous: days(previous)
 	})
 
 	return `measurr:${dataset.key}:${await sha256(text)}`
+}
+
+/** A tenant scope as JSON: a list is the same scope in any order. */
+function scopeKey(tenant: Tenant) {
+	if (tenant === allTenants) return { all: true }
+	return Array.isArray(tenant)
+		? [...new Set(tenant.map((id) => JSON.stringify(id)))].sort()
+		: tenant
+}
+
+/** The query's filters, with the keys the label lookups found in place of the values given. */
+function resolvedFilters(
+	query: NormalizedQuery,
+	resolvedValues: ReadonlyMap<string, readonly (string | number)[]>
+): NormalizedFilter[] {
+	return query.filters.map((filter) => {
+		const resolved = resolvedValues.get(filter.dimension)
+		return resolved && 'values' in filter
+			? { ...filter, values: [...resolved] }
+			: filter
+	})
+}
+
+/**
+ * What decides the rows a query's ungrouped statement reads: queries of a batch with the same
+ * key share one statement. Not the clock: `minutesAgo` counts from the first query's.
+ */
+function statementKey(
+	prepared: Prepared,
+	filters: readonly NormalizedFilter[]
+): string {
+	const { dataset, query, tenant, timezone, period, previous } = prepared
+
+	return stableJson({
+		dataset: dataset.key,
+		tenant: scopeKey(tenant),
+		timezone,
+		time: period && query.time,
+		period: period && [period.start.getTime(), period.end.getTime()],
+		previous: previous?.start.getTime() ?? null,
+		// Every filter must match, so their order does not matter.
+		filters: filters.map((filter) => stableJson(filter)).sort()
+	})
 }
 
 async function sha256(text: string): Promise<string> {
@@ -1084,54 +1211,6 @@ function semaphore(max: number): Acquire {
 	}
 }
 
-type Shared<T> = {
-	promise: Promise<T>
-	controller: AbortController
-	waiting: number
-}
-
-/**
- * One run of `start` for every caller that asks for `key` while it is in flight. A caller's
- * abort rejects only its own wait; the run stops when every caller has aborted.
- */
-function share<T>(
-	inFlight: Map<string, Shared<T>>,
-	key: string,
-	start: (signal: AbortSignal) => Promise<T>,
-	signal: AbortSignal | undefined
-): Promise<T> {
-	let entry = inFlight.get(key)
-	if (!entry) {
-		const controller = new AbortController()
-		const created: Shared<T> = {
-			controller,
-			waiting: 0,
-			promise: start(controller.signal).finally(() => {
-				if (inFlight.get(key) === created) inFlight.delete(key)
-			})
-		}
-		inFlight.set(key, created)
-		entry = created
-	}
-	const shared = entry
-	shared.waiting++
-	if (!signal) return shared.promise
-
-	return new Promise<T>((resolve, reject) => {
-		const onAbort = () => {
-			if (--shared.waiting === 0) {
-				if (inFlight.get(key) === shared) inFlight.delete(key)
-				shared.controller.abort(signal.reason)
-			}
-			reject(signal.reason)
-		}
-		signal.addEventListener('abort', onAbort, { once: true })
-		shared.promise.then(resolve, reject).finally(() => {
-			signal.removeEventListener('abort', onAbort)
-		})
-	})
-}
-
 /** JSON with object keys sorted, so equal values give equal text. */
 function stableJson(value: unknown): string {
 	return JSON.stringify(value, (_key, inner: unknown) =>
@@ -1164,26 +1243,40 @@ function isTenantId(value: unknown): value is TenantId {
 }
 
 /**
- * The statement for a period's rows, and for its totals when the query groups and wants them
- * (or a resolved measure needs them).
+ * The statements of a query. `rows` are a grouped query's: one statement per period. `ungrouped`
+ * builds the one statement that does not group, for the SQL measures it is given: the rows of a
+ * query that does not group, or a grouped query's totals (null when it wants none and no
+ * resolved measure needs them). It reads both periods at once when there are two.
  */
-function periodStatements(
+function queryStatements(
 	dataset: AnyDataset,
 	query: NormalizedQuery,
-	context: PlanContext
-) {
+	context: PlanContext,
+	previous: ResolvedPeriod | null
+): {
+	rows: SelectStatement[]
+	ungrouped: ((measures: readonly string[]) => SelectStatement) | null
+} {
+	const { period } = context
 	const grouped = query.groupBy.length > 0
 	const resolved = query.measures.some(
 		(key) =>
 			(dataset.measures[key] as AnyMeasure | undefined)?.kind === 'resolved'
 	)
+	const rowsOf = (target: ResolvedPeriod | null) =>
+		planQuery(dataset, query, { ...context, period: target }, true)
+	const ungrouped = (measures: readonly string[]) => {
+		const counted = { ...query, measures: [...measures] }
+		return period && previous
+			? planComparison(dataset, counted, { ...context, period }, previous)
+			: planQuery(dataset, counted, context, false)
+	}
 
 	return {
-		rows: planQuery(dataset, query, context, true),
-		totals:
-			grouped && (query.totals || resolved)
-				? planQuery(dataset, query, context, false)
-				: null
+		rows: grouped
+			? [rowsOf(period), ...(previous ? [rowsOf(previous)] : [])]
+			: [],
+		ungrouped: !grouped || query.totals || resolved ? ungrouped : null
 	}
 }
 
@@ -1262,30 +1355,48 @@ function compileEverything(dataset: AnyDataset, dialect: Dialect): string {
 	return texts.join('\n')
 }
 
+type OpenFilter = {
+	filter: Extract<NormalizedFilter, { values: unknown }>
+	dimension: AnyDimension
+	wanted: string[]
+}
+
+/** The filters that name values of an open dimension (tags, teams), by key or by label. */
+function openFilters(
+	dataset: AnyDataset,
+	query: NormalizedQuery
+): OpenFilter[] {
+	return query.filters.flatMap((filter) => {
+		if (filter.op !== 'in' && filter.op !== 'notIn') return []
+		const dimension: AnyDimension | undefined =
+			dataset.dimensions[filter.dimension]
+		if (dimension?.category !== 'open') return []
+		return [{ filter, dimension, wanted: filter.values.map(String) }]
+	})
+}
+
 /**
- * Turns the keys or labels given for open dimensions (tags, teams) into keys. An unknown value
- * fails with the valid values listed, so a model can fix its query in one retry.
+ * Turns the keys or labels given for open dimensions into keys. An unknown value fails with
+ * the valid values listed, so a model can fix its query in one retry.
  */
 async function resolveOpenValues(
 	dataset: AnyDataset,
-	query: NormalizedQuery,
+	open: readonly OpenFilter[],
 	tenant: Tenant,
 	now: Date,
 	run: (statement: SelectStatement) => Promise<readonly Row[]>,
 	dialect: Dialect
 ): Promise<Map<string, (string | number)[]>> {
+	// One lookup per filter, all at once; an unknown value is then reported in filter order.
+	const lookups = await Promise.all(
+		open.map(({ filter, wanted }) =>
+			run(planLookup(dataset, filter.dimension, tenant, wanted, now))
+		)
+	)
 	const resolved = new Map<string, (string | number)[]>()
 
-	for (const filter of query.filters) {
-		if (filter.op !== 'in' && filter.op !== 'notIn') continue
-		const dimension: AnyDimension | undefined =
-			dataset.dimensions[filter.dimension]
-		if (dimension?.category !== 'open') continue
-
-		const wanted = filter.values.map(String)
-		const found = await run(
-			planLookup(dataset, filter.dimension, tenant, wanted, now)
-		)
+	for (const [index, { filter, dimension, wanted }] of open.entries()) {
+		const found = lookups[index] ?? []
 		const keys = new Set<string | number>()
 		const unknown: string[] = []
 

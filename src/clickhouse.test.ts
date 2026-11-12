@@ -14,6 +14,7 @@ import {
 import { clickhouseDialect, toQueryParams } from './dialects/clickhouse.js'
 import { orders } from './fixtures/orders.js'
 import { sprays } from './fixtures/sprays.js'
+import { queryBatch } from './handler.js'
 import { assertDatasetContract } from './testing.js'
 
 const NOW = new Date('2026-10-07T10:00:00Z')
@@ -269,6 +270,86 @@ describe.skipIf(!url)('clickhouse integration', () => {
 			['2026-10-02', 15],
 			['2026-10-04', 7]
 		])
+	})
+
+	test('a comparison counts what each period counts on its own', async () => {
+		const period = { from: '2026-09-25', to: '2026-10-07' }
+		const before = { from: '2026-09-12', to: '2026-09-24' }
+
+		for (const measures of [
+			['sprays', 'reports', 'units', 'averageBattery'],
+			['medianBattery', 'lowLiquidShare', 'spraysPerUnit']
+		] as const) {
+			for (const groupBy of [[], ['placement']] as const) {
+				const query = { dataset: 'sprays', measures, groupBy } as const
+				const [compared, current, previous] = await Promise.all([
+					analytics.query(
+						{ ...query, period, compareToPrevious: true },
+						tenantA
+					),
+					analytics.query({ ...query, period }, tenantA),
+					analytics.query({ ...query, period: before }, tenantA)
+				])
+
+				expect(compared.rows).toEqual(current.rows)
+				expect(compared.totals).toEqual(current.totals)
+				expect(compared.previous.rows).toEqual(previous.rows)
+				expect(compared.previous.totals).toEqual(previous.totals)
+			}
+		}
+	})
+
+	test('queries of a batch share a statement and count what they count alone', async () => {
+		const texts: string[] = []
+		const counting = analyticsOn({
+			dialect: source.dialect,
+			execute: (statement) => {
+				texts.push(statement.text)
+				return source.execute(statement)
+			}
+		})
+		const compared = {
+			dataset: 'sprays',
+			period: { from: '2026-09-25', to: '2026-10-07' },
+			compareToPrevious: true
+		} as const
+		const queries = {
+			volume: { ...compared, measures: ['sprays', 'reports'] },
+			battery: { ...compared, measures: ['averageBattery'] },
+			low: { ...compared, measures: ['lowLiquidShare'] },
+			perDay: { ...compared, measures: ['spraysPerDay'] },
+			// A distinct count and a median: each query a statement of its own.
+			units: { ...compared, measures: ['units', 'spraysPerUnit'] },
+			median: { ...compared, measures: ['medianBattery'] },
+			byPlacement: {
+				...compared,
+				measures: ['sprays'],
+				groupBy: ['placement']
+			}
+		} as const
+
+		const { results, errors } = await queryBatch(counting, queries, tenantA)
+
+		expect(errors).toEqual({})
+		// The grouped rows of each period, the two costly queries, and one for the rest.
+		expect(texts).toHaveLength(5)
+		expect(results.volume).toEqual(
+			await analytics.query(queries.volume, tenantA)
+		)
+		expect(results.battery).toEqual(
+			await analytics.query(queries.battery, tenantA)
+		)
+		expect(results.low).toEqual(await analytics.query(queries.low, tenantA))
+		expect(results.units).toEqual(await analytics.query(queries.units, tenantA))
+		expect(results.median).toEqual(
+			await analytics.query(queries.median, tenantA)
+		)
+		expect(results.perDay).toEqual(
+			await analytics.query(queries.perDay, tenantA)
+		)
+		expect(results.byPlacement).toEqual(
+			await analytics.query(queries.byPlacement, tenantA)
+		)
 	})
 
 	test('a resolved measure divides by the days of each period', async () => {

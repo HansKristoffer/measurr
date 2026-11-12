@@ -5,7 +5,7 @@ import type {
 	SelectStatement
 } from './compile.js'
 import type { AnyDataset, AnyDimension, AnyMeasure } from './dataset.js'
-import type { ExprNode, ParamValue } from './expr.js'
+import { type ExprNode, type ParamValue, walk } from './expr.js'
 import type { PeriodInput, ResolvedPeriod } from './period.js'
 import { DEFAULT_LIMIT } from './query.js'
 
@@ -159,6 +159,24 @@ function measureNode(dataset: AnyDataset, key: string): ExprNode {
 				`Dataset ${dataset.key}: measure ${key} is resolved by the app, not the database`
 			)
 	}
+}
+
+/**
+ * Whether the database computes a measure in one pass over the rows: counts, sums and averages
+ * without a subquery. Such measures cost next to nothing more in a statement that already reads
+ * the rows. A distinct count, a median and a measure with `exists` cost as much there as on
+ * their own, where they at least run side by side.
+ */
+export function isOnePass(dataset: AnyDataset, key: string): boolean {
+	let onePass = true
+	walk(measureNode(dataset, key), (node) => {
+		const sorts =
+			node.kind === 'aggregate' &&
+			(node.fn === 'countDistinct' || node.fn === 'median')
+		if (sorts || node.kind === 'exists') onePass = false
+	})
+
+	return onePass
 }
 
 /**
@@ -374,8 +392,23 @@ function neverNull(node: ExprNode): boolean {
 /** Output column aliases. Keys come from definitions, never from input. */
 export const columnAlias = {
 	measure: (key: string) => `m_${key}`,
+	/** A measure over the previous period, in a statement that counts both periods. */
+	previousMeasure: (key: string) => `p_${key}`,
 	groupKey: (key: string) => `g_${key}`,
 	groupLabel: (key: string) => `g_${key}__label`
+}
+
+/** The previous period's measures of a row that holds both periods, under the usual aliases. */
+export function previousRow(
+	raw: Record<string, unknown>
+): Record<string, unknown> {
+	const prefix = columnAlias.previousMeasure('')
+	const row: Record<string, unknown> = {}
+	for (const [alias, value] of Object.entries(raw)) {
+		if (alias.startsWith(prefix))
+			row[columnAlias.measure(alias.slice(prefix.length))] = value
+	}
+	return row
 }
 
 /**
@@ -404,43 +437,119 @@ export function planQuery(
 			select.push({ alias: columnAlias.groupLabel(key), node: nodes.label })
 		}
 	}
-	const measureKeys = sqlMeasures(dataset, query.measures)
-	for (const key of measureKeys) {
+	for (const key of sqlMeasures(dataset, query.measures)) {
 		select.push({
 			alias: columnAlias.measure(key),
 			node: measureNode(dataset, key)
 		})
 	}
 	// Only resolved measures that use nothing: the statement still returns the groups.
-	if (select.length === 0) {
-		select.push({
-			alias: 'row_count',
-			node: { kind: 'aggregate', fn: 'count', arg: null, where: null }
-		})
-	}
-
-	const where = [
-		...baseWhere(
-			dataset,
-			context.tenant,
-			context.period && {
-				time: query.time,
-				start: context.period.start,
-				end: context.period.end
-			}
-		),
-		...query.filters.map((filter) => filterNode(dataset, filter, context))
-	]
+	if (select.length === 0) select.push(ROW_COUNT)
 
 	return {
 		from: dataset.from,
 		virtualJoins,
-		where,
+		where: queryWhere(dataset, query, context, context.period),
 		select,
 		groupBy,
 		orderBy: groupKeys.length > 0 ? orderBy(dataset, query, select) : [],
 		limit: grouped && groupKeys.length > 0 ? query.limit + 1 : null,
 		now: context.now
+	}
+}
+
+const ROW_COUNT: SelectItem = {
+	alias: 'row_count',
+	node: { kind: 'aggregate', fn: 'count', arg: null, where: null }
+}
+
+/** Tenant, scope, the days from `period.start` up to `period.end`, and the query's filters. */
+function queryWhere(
+	dataset: AnyDataset,
+	query: NormalizedQuery,
+	context: PlanContext,
+	period: { start: Date; end: Date } | null
+): ExprNode[] {
+	return [
+		...baseWhere(
+			dataset,
+			context.tenant,
+			period && { time: query.time, start: period.start, end: period.end }
+		),
+		...query.filters.map((filter) => filterNode(dataset, filter, context))
+	]
+}
+
+/**
+ * One ungrouped statement for a period and the one before it: the rows of both are read once,
+ * and every measure is computed twice, over the rows from `period.start` on and over the rows
+ * before it (the `previousMeasure` columns). The periods are adjacent, so one range covers both.
+ */
+export function planComparison(
+	dataset: AnyDataset,
+	query: NormalizedQuery,
+	context: PlanContext & { period: ResolvedPeriod },
+	previous: ResolvedPeriod
+): SelectStatement {
+	const field = dataset.time[query.time]
+	if (!field)
+		throw new Error(`Dataset ${dataset.key} has no time field ${query.time}`)
+	const boundary = (op: '>=' | '<'): ExprNode => ({
+		kind: 'compare',
+		op,
+		left: field.column,
+		right: param(context.period.start)
+	})
+
+	const select: SelectItem[] = []
+	for (const key of sqlMeasures(dataset, query.measures)) {
+		const node = measureNode(dataset, key)
+		select.push(
+			{
+				alias: columnAlias.measure(key),
+				node: onlyWhere(node, boundary('>='))
+			},
+			{
+				alias: columnAlias.previousMeasure(key),
+				node: onlyWhere(node, boundary('<'))
+			}
+		)
+	}
+	if (select.length === 0) select.push(ROW_COUNT)
+
+	return {
+		from: dataset.from,
+		virtualJoins: [],
+		where: queryWhere(dataset, query, context, {
+			start: previous.start,
+			end: context.period.end
+		}),
+		select,
+		groupBy: [],
+		orderBy: [],
+		limit: null,
+		now: context.now
+	}
+}
+
+/** A measure's expression with every aggregate in it counting only rows that match `condition`. */
+function onlyWhere(node: ExprNode, condition: ExprNode): ExprNode {
+	switch (node.kind) {
+		case 'aggregate':
+			return {
+				...node,
+				where: node.where ? and([node.where, condition]) : condition
+			}
+		case 'arithmetic':
+			return {
+				...node,
+				left: onlyWhere(node.left, condition),
+				right: onlyWhere(node.right, condition)
+			}
+		default:
+			throw new Error(
+				`A measure cannot hold a ${node.kind} outside an aggregate`
+			)
 	}
 }
 

@@ -41,11 +41,10 @@ const visits = defineDataset({
 		forecast: measure.resolved({ label: 'Forecast', result: 'count' })
 	},
 	dimensions: {
-		kind: dimension.enum(
-			visit.col('kind'),
-			{ A: 'A', B: 'B' },
-			{ label: 'Kind', labels: { A: 'Alpha', B: 'Beta' } }
-		)
+		kind: dimension.enum(visit.col('kind'), {
+			label: 'Kind',
+			labels: { A: 'Alpha', B: 'Beta' }
+		})
 	}
 })
 
@@ -81,7 +80,16 @@ function setup(
 							{ g_kind: 'B', m_visits: '1', m_minutes: null }
 						]
 					}
-					return [{ m_visits: '3', m_minutes: '30', row_count: '3' }]
+					return [
+						{
+							m_visits: '3',
+							m_minutes: '30',
+							row_count: '3',
+							// Read only from a statement that counts both periods at once.
+							p_visits: '3',
+							p_minutes: '30'
+						}
+					]
 				}
 			}
 		},
