@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/HansKristoffer/measurr/compare/v0.7.0...v0.8.0) (2026-11-12)
+
+
+### Features
+
+* metric periods, resolve metrics and query options from platform reviews ([#14](https://github.com/HansKristoffer/measurr/issues/14)) ([20f675b](https://github.com/HansKristoffer/measurr/commit/20f675bc21ec707f42001f71ea13473fe5a81b19))
+
 ## [0.7.0](https://github.com/HansKristoffer/measurr/compare/v0.6.0...v0.7.0) (2026-10-21)
 
 
