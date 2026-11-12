@@ -7,11 +7,18 @@ import { createAnalytics } from './index.js'
 import {
 	createMetricRegistry,
 	type MetricChunk,
+	MetricError,
 	type MetricFiltersOf,
 	type MetricKeysOfKind,
+	MetricOutputSchema,
 	type MetricOutputOf,
-	metricDefiner
+	type MetricResult,
+	MetricResultSchema,
+	metricDefiner,
+	metricOutputSchemas
 } from './metrics.js'
+import { presentKpi, presentTimeseries } from './shapes.js'
+import { assertMetricContract, checkMetricContract } from './testing.js'
 import { localDate } from './period.js'
 import type {
 	KpiOutput,
@@ -197,7 +204,8 @@ describe('createMetricRegistry', () => {
 				],
 				chartType: 'donut'
 			},
-			supportsTimeRange: false
+			supportsTimeRange: false,
+			period: { all: true, timezone: TIMEZONE }
 		})
 	})
 
@@ -237,13 +245,15 @@ describe('createMetricRegistry', () => {
 			key: 'orders.paidShare',
 			requestKey: 'orders.paidShare',
 			error: 'Access denied',
+			code: 'forbidden',
 			done: false
 		})
 		expect(chunks[1]?.error).toStartWith('Invalid filters:')
 		expect(chunks.find((chunk) => chunk.requestKey === 'paid')?.result).toEqual(
 			{
 				current: { kind: 'kpi', value: 2, label: 'Orders' },
-				supportsTimeRange: true
+				supportsTimeRange: true,
+				period: { from: '2026-10-01', to: '2026-10-07', timezone: TIMEZONE }
 			}
 		)
 		expect(statements.some((s) => s.values.includes('PAID'))).toBe(true)
@@ -263,7 +273,8 @@ describe('createMetricRegistry', () => {
 						}
 					]
 				},
-				supportsTimeRange: true
+				supportsTimeRange: true,
+				period: { from: '2026-10-01', to: '2026-10-07', timezone: TIMEZONE }
 			},
 			done: expect.any(Boolean)
 		})
@@ -304,7 +315,9 @@ describe('createMetricRegistry', () => {
 					}
 				})
 			],
-			onShapeError: (_, metric) => shapeErrors.push(metric.key)
+			onShapeError: (_, metric) => shapeErrors.push(metric.key),
+			onError: (error, failure) =>
+				shapeErrors.push(`${failure.code}: ${(error as Error).message}`)
 		})
 		const [failed] = await Array.fromAsync(
 			broken.run({ metrics: [{ key: 'orders.broken' }] }, {})
@@ -313,9 +326,10 @@ describe('createMetricRegistry', () => {
 			key: 'orders.broken',
 			requestKey: 'orders.broken',
 			error: 'The metric could not be drawn',
+			code: 'shape_failed',
 			done: true
 		})
-		expect(shapeErrors).toEqual(['orders.broken'])
+		expect(shapeErrors).toEqual(['orders.broken', 'shape_failed: no rows in 0'])
 	})
 
 	test('lists the metrics ctx may run, and refuses duplicate keys', async () => {
@@ -438,4 +452,346 @@ describe('registry types', () => {
 			shape: () => ({ kind: 'leaderboard', items: [] })
 		})
 	})
+})
+
+describe('periods, resolve metrics and errors', () => {
+	type Viewer = { tenantId?: string; userId: string }
+	const NOW = new Date('2026-11-10T10:00:00Z')
+	const defineMetric = metricDefiner<typeof orders, Role, object, Viewer>()
+
+	const mine = defineMetric({
+		key: 'orders.mine',
+		kind: 'kpi',
+		description: 'Orders of the customer signed in',
+		supportsTimeRange: true,
+		query: ({ ctx }) => ({
+			dataset: 'orders',
+			measures: ['orders'],
+			filters: [{ dimension: 'region', op: 'in', values: [ctx.userId] }]
+		}),
+		shape: (result) => presentKpi(result, 'orders')
+	})
+	const seats = defineMetric({
+		key: 'seats.used',
+		kind: 'kpi',
+		description: 'Seats in use, from the billing database',
+		supportsTimeRange: true,
+		resolve: async ({ period, tenant, ctx }) => ({
+			kind: 'kpi',
+			value: period?.days ?? 0,
+			label: `${String(tenant)}:${ctx.userId}`
+		})
+	})
+	const daily = defineMetric({
+		key: 'orders.daily',
+		kind: 'timeseries',
+		description: 'Orders per day',
+		supportsTimeRange: true,
+		query: ({ bucket }) => ({
+			dataset: 'orders',
+			measures: ['orders'],
+			groupBy: [bucket],
+			limit: 2
+		}),
+		shape: (result, { bucket }) =>
+			presentTimeseries(result, { bucket, measure: 'orders' })
+	})
+
+	function setup(rows: Record<string, unknown>[] = []) {
+		const statements: { text: string; values: readonly unknown[] }[] = []
+		const signals: AbortSignal[] = []
+		const failures: [unknown, string, string][] = []
+		const analytics = createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text, values }, options) => {
+						statements.push({ text, values })
+						if (options?.signal) signals.push(options.signal)
+						if (text.includes('"label"')) return [{ key: 'u1', label: 'u1' }]
+						return text.includes('"g_') ? rows : [{ m_orders: 4 }]
+					}
+				}
+			},
+			tenant: (ctx: Viewer) => ctx.tenantId,
+			timezone: () => 'Europe/Copenhagen',
+			now: () => NOW
+		})
+		const registry = createMetricRegistry({
+			analytics,
+			metrics: [mine, seats, daily] as const,
+			onError: (error, failure) =>
+				failures.push([error, failure.code, failure.requestKey])
+		})
+		return { registry, statements, signals, failures }
+	}
+	const viewer: Viewer = { tenantId: 't1', userId: 'u1' }
+
+	test('a request names its period in local days, and each result echoes it', async () => {
+		const { registry } = setup()
+		const { results } = await registry.collect(
+			{
+				metrics: [{ key: 'orders.mine' }, { key: 'seats.used' }],
+				period: { last: { days: 7 } }
+			},
+			viewer
+		)
+
+		const period = {
+			from: '2026-11-04',
+			to: '2026-11-10',
+			timezone: 'Europe/Copenhagen'
+		}
+		expect(results['orders.mine']?.period).toEqual(period)
+		expect(results['seats.used']).toEqual({
+			current: { kind: 'kpi', value: 7, label: 't1:u1' },
+			supportsTimeRange: true,
+			period
+		})
+	})
+
+	test('from without to counts up to today; to without from, or both forms, is refused', async () => {
+		const { registry } = setup()
+		const result = await registry.one(
+			'seats.used',
+			{ from: new Date('2026-11-01T12:00:00Z') },
+			viewer
+		)
+		expect(result.period).toEqual({
+			from: '2026-11-01',
+			to: '2026-11-10',
+			timezone: 'Europe/Copenhagen'
+		})
+
+		await expect(
+			registry.one('seats.used', { to: NOW }, viewer)
+		).rejects.toMatchObject({ code: 'invalid_period' })
+		await expect(
+			registry.one(
+				'seats.used',
+				{ from: NOW, period: { last: { days: 7 } } },
+				viewer
+			)
+		).rejects.toMatchObject({ code: 'invalid_period' })
+	})
+
+	test('a resolve metric gets its previous period and the tenant from ctx', async () => {
+		const { registry } = setup()
+		const result = await registry.one(
+			'seats.used',
+			{
+				period: { from: '2026-11-01', to: '2026-11-03' },
+				compareToPrevious: true
+			},
+			viewer
+		)
+
+		expect(result.current.value).toBe(3)
+		expect(result.previous).toEqual({ kind: 'kpi', value: 3, label: 't1:u1' })
+
+		const { registry: scoped, failures } = setup()
+		await expect(
+			scoped.one('seats.used', {}, { userId: 'u1' })
+		).rejects.toMatchObject({ code: 'missing_tenant' })
+		expect(failures.map(([, code]) => code)).toEqual(['missing_tenant'])
+	})
+
+	test('a query gets ctx, and the tenant scope still applies', async () => {
+		const { registry, statements } = setup()
+		await registry.one('orders.mine', {}, viewer)
+
+		const query = statements.at(-1)
+		expect(query?.values).toContain('t1')
+		expect(query?.values).toContain('u1')
+	})
+
+	test('every failure has a code, and onError hears each one', async () => {
+		const { registry, failures } = setup()
+		const { errors } = await registry.collect(
+			{
+				metrics: [
+					{ key: 'orders.lost' as never },
+					{ key: 'seats.used', requestKey: 'bad', filters: 'x' }
+				]
+			},
+			viewer
+		)
+
+		expect(errors).toEqual({
+			'orders.lost': { code: 'unknown_metric', message: 'Unknown metric' },
+			bad: {
+				code: 'invalid_filters',
+				message: expect.stringContaining('Invalid filters')
+			}
+		})
+		expect(
+			failures.map(([error, code]) => [code, error instanceof MetricError])
+		).toEqual([
+			['unknown_metric', true],
+			['invalid_filters', true]
+		])
+	})
+
+	test('a time series cut at its limit fails instead of drawing zeros', async () => {
+		const { registry } = setup([
+			{ g_day: '2026-11-08', m_orders: 1 },
+			{ g_day: '2026-11-09', m_orders: 1 },
+			{ g_day: '2026-11-10', m_orders: 1 }
+		])
+
+		await expect(
+			registry.one('orders.daily', { period: { last: { days: 3 } } }, viewer)
+		).rejects.toMatchObject({ code: 'truncated' })
+	})
+
+	test('collect and one are typed per metric', async () => {
+		const { registry } = setup()
+		const { results } = await registry.collect(
+			{ metrics: [{ key: 'orders.daily' }] },
+			viewer
+		)
+		expectTypeOf(results['orders.daily']).toEqualTypeOf<
+			MetricResult<TimeSeriesOutput> | undefined
+		>()
+		const one = await registry.one('seats.used', {}, viewer)
+		expectTypeOf(one.current).toEqualTypeOf<{
+			kind: 'kpi'
+			value: number
+			label: string
+		}>()
+	})
+
+	test('a consumer that stops reading aborts the statements', async () => {
+		const { registry, signals } = setup()
+		for await (const chunk of registry.run(
+			{
+				metrics: [
+					{ key: 'orders.mine' },
+					{ key: 'orders.mine', requestKey: 'again' }
+				]
+			},
+			viewer
+		)) {
+			expect(chunk.error).toBeUndefined()
+			break
+		}
+
+		expect(signals.length).toBeGreaterThan(0)
+		expect(signals.every((signal) => signal.aborted)).toBe(true)
+	})
+
+	test('a run with an aborted signal rejects with its reason', async () => {
+		const { registry } = setup()
+		const controller = new AbortController()
+		controller.abort(new Error('closed'))
+
+		await expect(
+			registry.collect({ metrics: [{ key: 'seats.used' }] }, viewer, {
+				signal: controller.signal
+			})
+		).rejects.toThrow('closed')
+	})
+})
+
+describe('previous-period alignment', () => {
+	test('weeks pair from the end, and a series only in the previous period gets current buckets', async () => {
+		const analytics = createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text, values }) => {
+						if (!text.includes('"g_week"')) return [{ m_orders: 1 }]
+						// The previous period (2026-09-16 to 2026-09-30) spans three ISO weeks.
+						return values.includes('2026-09-15T22:00:00.000Z')
+							? [
+									{ g_week: '2026-09-14', g_status: 'OPEN', m_orders: 1 },
+									{ g_week: '2026-09-21', g_status: 'OPEN', m_orders: 2 },
+									{ g_week: '2026-09-28', g_status: 'OPEN', m_orders: 3 }
+								]
+							: [{ g_week: '2026-10-05', g_status: 'PAID', m_orders: 5 }]
+					}
+				}
+			},
+			tenant: () => 't1',
+			timezone: () => 'Europe/Copenhagen'
+		})
+		const registry = createMetricRegistry({
+			analytics,
+			metrics: [orderMetrics[2]] as const
+		})
+
+		const result = await registry.one(
+			'orders.trend',
+			{
+				period: { from: '2026-10-01', to: '2026-10-15' },
+				granularity: 'week',
+				compareToPrevious: true,
+				filters: { byStatus: true }
+			},
+			{}
+		)
+
+		const buckets = result.current.series[0]?.points.map(
+			(point) => point.bucket
+		)
+		expect(buckets).toEqual(['2026-09-28', '2026-10-05', '2026-10-12'])
+		const previous = result.previous?.series[0]
+		expect(previous?.key).toBe('OPEN')
+		expect(
+			previous?.points.map((point) => [point.bucket, point.value])
+		).toEqual([
+			['2026-09-28', 1],
+			['2026-10-05', 2],
+			['2026-10-12', 3]
+		])
+	})
+})
+
+describe('output schemas', () => {
+	test('every presented output parses, also back from JSON', async () => {
+		const { registry } = registryWith()
+		const { results } = await registry.collect(
+			{
+				metrics: registry.keys.map((key) => ({ key })),
+				...week,
+				compareToPrevious: true
+			},
+			owner
+		)
+
+		for (const result of Object.values(results)) {
+			if (!result) continue
+			const json = JSON.parse(JSON.stringify(result))
+			expect(MetricResultSchema.parse(json)).toEqual(result)
+			expect(
+				metricOutputSchemas[result.current.kind].parse(json.current)
+			).toEqual(result.current)
+		}
+		expect(MetricOutputSchema.safeParse({ kind: 'gauge' }).success).toBe(false)
+	})
+})
+
+test('the metric contract kit runs every metric of a registry', async () => {
+	const { registry } = registryWith()
+	expect((await checkMetricContract({ registry, ctx: owner })).ok).toBe(true)
+
+	const report = await checkMetricContract({
+		registry,
+		ctx: { role: 'member', timezone: TIMEZONE }
+	})
+	expect(report.checks.filter((check) => !check.ok)).toEqual([
+		{
+			name: 'metric orders.paidShare',
+			ok: false,
+			message: 'forbidden: Access denied'
+		}
+	])
+	await expect(
+		assertMetricContract({
+			registry,
+			ctx: { role: 'member', timezone: TIMEZONE }
+		})
+	).rejects.toThrow('orders.paidShare')
 })

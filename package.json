@@ -1,7 +1,7 @@
 {
 	"name": "measurr",
 	"version": "0.7.0",
-	"description": "A small typed semantic layer: datasets of measures and dimensions compiled to one SQL statement per dialect.",
+	"description": "A small typed semantic layer: datasets of measures and dimensions compiled to SQL for Postgres and ClickHouse, with chart shapes and dashboard metrics.",
 	"type": "module",
 	"module": "./dist/index.js",
 	"main": "./dist/index.js",
@@ -97,7 +97,7 @@
 		"zod": "^4.3.6"
 	},
 	"peerDependencies": {
-		"typescript": ">=6.0.0",
+		"typescript": ">=5.9.0",
 		"zod": "^4.0.0"
 	},
 	"peerDependenciesMeta": {

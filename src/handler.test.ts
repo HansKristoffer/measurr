@@ -117,3 +117,49 @@ describe('toHttpError', () => {
 		})
 	})
 })
+
+describe('cancelling a batch', () => {
+	function recording() {
+		const signals: AbortSignal[] = []
+		const analytics = createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text }, options) => {
+						if (options?.signal) signals.push(options.signal)
+						if (text.includes('"g_status"')) await Bun.sleep(20)
+						return [{ m_orders: 2 }]
+					}
+				}
+			},
+			tenant: (ctx: Ctx) => ctx.tenantId
+		})
+		return { analytics, signals }
+	}
+	const queries = {
+		total: { dataset: 'orders', measures: ['orders'] },
+		byStatus: { dataset: 'orders', measures: ['orders'], groupBy: ['status'] }
+	} as const
+
+	test('a consumer that stops reading aborts what still runs', async () => {
+		const { analytics, signals } = recording()
+		for await (const chunk of streamBatch(analytics, queries, ctx)) {
+			expect(chunk.key).toBe('total')
+			break
+		}
+
+		expect(signals.length).toBeGreaterThan(0)
+		expect(signals.every((signal) => signal.aborted)).toBe(true)
+	})
+
+	test('an aborted signal rejects the batch with its reason', async () => {
+		const { analytics } = recording()
+		const controller = new AbortController()
+		setTimeout(() => controller.abort(new Error('closed')), 5)
+
+		await expect(
+			queryBatch(analytics, queries, ctx, { signal: controller.signal })
+		).rejects.toThrow('closed')
+	})
+})

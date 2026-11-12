@@ -7,7 +7,8 @@ import {
 	type Analytics,
 	AnalyticsError,
 	type AnalyticsErrorCode,
-	type AnalyticsErrorDetails
+	type AnalyticsErrorDetails,
+	type QueryOptions
 } from './analytics.js'
 import type { AnyDataset } from './dataset.js'
 import type { DatasetQuery, ResultOf } from './query.js'
@@ -45,12 +46,13 @@ export async function queryBatch<
 >(
 	analytics: Analytics<DS, Ctx>,
 	queries: Q,
-	ctx: Ctx
+	ctx: Ctx,
+	options?: BatchOptions
 ): Promise<BatchResult<DS, Q>> {
 	const results: Record<string, unknown> = {}
 	const errors: Record<string, BatchError> = {}
 
-	for await (const chunk of streamBatch(analytics, queries, ctx)) {
+	for await (const chunk of streamBatch(analytics, queries, ctx, options)) {
 		if ('error' in chunk) errors[chunk.key] = chunk.error
 		else results[chunk.key] = chunk.result
 	}
@@ -58,7 +60,13 @@ export async function queryBatch<
 	return { results, errors } as BatchResult<DS, Q>
 }
 
-/** Runs named queries in parallel and yields each as it finishes, for a streaming endpoint. */
+/** Aborting `signal` stops the batch's statements and rejects with its reason. */
+export type BatchOptions = Pick<QueryOptions, 'signal'>
+
+/**
+ * Runs named queries in parallel and yields each as it finishes, for a streaming endpoint. A
+ * consumer that stops reading (a closed stream) stops the statements still running.
+ */
 export async function* streamBatch<
 	DS extends readonly AnyDataset[],
 	Ctx,
@@ -66,22 +74,34 @@ export async function* streamBatch<
 >(
 	analytics: Analytics<DS, Ctx>,
 	queries: Q,
-	ctx: Ctx
+	ctx: Ctx,
+	options: BatchOptions = {}
 ): AsyncGenerator<BatchChunk<DS, Q>, void, undefined> {
-	const pending = new Map(
-		Object.entries(queries).map(([key, query]) => {
-			const settled = analytics.query(query, ctx).then(
-				(result) => ({ key, result }),
-				(error: unknown) => ({ key, error: batchError(error) })
-			)
-			return [key, settled] as const
-		})
-	)
+	options.signal?.throwIfAborted()
+	const controller = new AbortController()
+	const signal = options.signal
+		? AbortSignal.any([options.signal, controller.signal])
+		: controller.signal
 
-	while (pending.size > 0) {
-		const chunk = await Promise.race(pending.values())
-		pending.delete(chunk.key)
-		yield chunk as BatchChunk<DS, Q>
+	try {
+		const pending = new Map(
+			Object.entries(queries).map(([key, query]) => {
+				const settled = analytics.query(query, ctx, { signal }).then(
+					(result) => ({ key, result }),
+					(error: unknown) => ({ key, error: batchError(error) })
+				)
+				return [key, settled] as const
+			})
+		)
+
+		while (pending.size > 0) {
+			const chunk = await Promise.race(pending.values())
+			signal.throwIfAborted()
+			pending.delete(chunk.key)
+			yield chunk as BatchChunk<DS, Q>
+		}
+	} finally {
+		controller.abort()
 	}
 }
 

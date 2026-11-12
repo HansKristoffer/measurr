@@ -12,11 +12,13 @@ export {
 	type AnalyticsResolvers,
 	type AnalyticsResult,
 	type AnalyticsSource,
+	type CacheEntry,
 	createAnalytics,
 	type DatasetCatalogEntry,
 	type FieldKey,
 	isAnalyticsError,
 	type MeasureResolver,
+	type QueryOptions,
 	type ResolvedKey,
 	type ResolverInput,
 	type ResolverOutput
@@ -37,6 +39,7 @@ export {
 	type AnyDimension,
 	type AnyMeasure,
 	type Dataset,
+	type DimensionLookup,
 	type DimensionValue,
 	defineDataset,
 	dimension,
@@ -73,7 +76,7 @@ export {
 	toText
 } from './expr.js'
 export { analyticsToolGuidance } from './guidance.js'
-export type { PeriodInput, PeriodPreset } from './period.js'
+export type { PeriodInput, PeriodPreset, ResolvedPeriod } from './period.js'
 export {
 	allTenants,
 	type NormalizedFilter,
@@ -85,6 +88,10 @@ export {
 	type DatasetFilter,
 	type DatasetQuery,
 	type QueryResult,
+	type ResultFields,
+	type ResultGroupField,
+	type ResultMeasureField,
 	type ResultOf,
-	type ResultPeriod
+	type ResultPeriod,
+	type ResultWithoutTotals
 } from './query.js'

@@ -20,6 +20,8 @@ export type NormalizedQuery = {
 	compareToPrevious: boolean
 	sort: { by: string; direction: 'asc' | 'desc' } | null
 	limit: number
+	/** Whether the result carries totals (a grouped query runs a statement for them). */
+	totals: boolean
 }
 
 export type NormalizedFilter =
@@ -43,6 +45,7 @@ export type ParsedQuery = {
 	compareToPrevious?: boolean | undefined
 	sort?: { by: string; direction?: 'asc' | 'desc' | undefined } | undefined
 	limit?: number | undefined
+	totals?: boolean | undefined
 }
 
 export function normalizeQuery(
@@ -67,7 +70,8 @@ export function normalizeQuery(
 		sort: parsed.sort
 			? { by: parsed.sort.by, direction: parsed.sort.direction ?? 'desc' }
 			: null,
-		limit: parsed.limit ?? DEFAULT_LIMIT
+		limit: parsed.limit ?? DEFAULT_LIMIT,
+		totals: parsed.totals ?? true
 	}
 }
 
@@ -233,6 +237,21 @@ function dimensionNodes(
 	}
 }
 
+/** `column` scoped to `tenant`, which is not `allTenants`. */
+function tenantWhere(
+	column: ExprNode,
+	tenant: Exclude<Tenant, typeof allTenants>
+): ExprNode[] {
+	const ids = typeof tenant === 'object' ? [...new Set(tenant)] : [tenant]
+	const [only] = ids
+	// One id compiles exactly like the scalar; an empty list renders as a false condition.
+	return [
+		ids.length === 1 && only !== undefined
+			? { kind: 'compare', op: '=', left: column, right: param(only) }
+			: { kind: 'in', item: column, values: ids.map(param), negated: false }
+	]
+}
+
 /** Tenant, scope and period: the conditions every statement of a query carries. */
 function baseWhere(
 	dataset: AnyDataset,
@@ -247,24 +266,7 @@ function baseWhere(
 				`Dataset ${dataset.key} has no tenant column; only allTenants may query it`
 			)
 		}
-		const ids = typeof tenant === 'object' ? [...new Set(tenant)] : [tenant]
-		const [only] = ids
-		// One id compiles exactly like the scalar; an empty list renders as a false condition.
-		where.push(
-			ids.length === 1 && only !== undefined
-				? {
-						kind: 'compare',
-						op: '=',
-						left: dataset.tenantColumn,
-						right: param(only)
-					}
-				: {
-						kind: 'in',
-						item: dataset.tenantColumn,
-						values: ids.map(param),
-						negated: false
-					}
-		)
+		where.push(...tenantWhere(dataset.tenantColumn, tenant))
 	}
 	if (dataset.scope) where.push(dataset.scope)
 
@@ -345,7 +347,7 @@ function filterNode(
 				values: values.map(param),
 				negated: filter.op === 'notIn'
 			}
-			if (filter.op === 'in') return list
+			if (filter.op === 'in' || neverNull(key)) return list
 			// "Not one of these" keeps rows without a value, unlike SQL's NOT IN.
 			return {
 				kind: 'logical',
@@ -354,6 +356,19 @@ function filterNode(
 			}
 		}
 	}
+}
+
+/**
+ * True for an expression that cannot be null: a literal, or a `caseWhen` whose results and
+ * `otherwise` all are. Saves rendering a costly expression twice for `notIn`.
+ */
+function neverNull(node: ExprNode): boolean {
+	if (node.kind === 'param') return node.value !== null
+	if (node.kind !== 'case' || !node.otherwise) return false
+	return (
+		neverNull(node.otherwise) &&
+		node.branches.every((branch) => neverNull(branch.result))
+	)
 }
 
 /** Output column aliases. Keys come from definitions, never from input. */
@@ -479,9 +494,17 @@ export function planLookup(
 	values: readonly string[] | null,
 	now: Date
 ): SelectStatement {
+	const dimension = dimensionOf(dataset, dimensionKey)
+	const lookup =
+		dimension.kind === 'relation' || dimension.kind === 'manyToMany'
+			? dimension.lookup
+			: undefined
 	const nodes = dimensionNodes(dataset, dimensionKey, 'UTC')
 	const label = nodes.label ?? nodes.key
-	const where = baseWhere(dataset, tenant, null)
+	// With `lookup`, the values are read from their own table, not from every fact row.
+	const where = lookup
+		? lookupWhere(dataset, lookup.tenantColumn, tenant)
+		: baseWhere(dataset, tenant, null)
 
 	where.push({ kind: 'isNull', item: nodes.key, negated: true })
 	if (values) {
@@ -506,8 +529,8 @@ export function planLookup(
 	}
 
 	return {
-		from: dataset.from,
-		virtualJoins: nodes.virtualJoin ? [nodes.virtualJoin] : [],
+		from: lookup ? lookup.table : dataset.from,
+		virtualJoins: !lookup && nodes.virtualJoin ? [nodes.virtualJoin] : [],
 		where,
 		select: [
 			{ alias: 'key', node: nodes.key },
@@ -518,6 +541,24 @@ export function planLookup(
 		limit: values ? 500 : 50,
 		now
 	}
+}
+
+/** The tenant condition of a lookup on a dimension's own table. */
+function lookupWhere(
+	dataset: AnyDataset,
+	tenantColumn: ExprNode | null,
+	tenant: Tenant
+): ExprNode[] {
+	if (tenant === allTenants || !tenantColumn) {
+		// `analytics.query` refuses this first; the planner fails closed on its own too.
+		if (!dataset.tenantColumn && tenant !== allTenants) {
+			throw new Error(
+				`Dataset ${dataset.key} has no tenant column; only allTenants may query it`
+			)
+		}
+		return []
+	}
+	return tenantWhere(tenantColumn, tenant)
 }
 
 // ---------------------------------------------------------------------------------------------
