@@ -458,3 +458,137 @@ describe('startup validation', () => {
 		).toThrow(/can produce "no"/)
 	})
 })
+
+describe('filter and lookup statements', () => {
+	test('notIn on a value that cannot be null does not repeat it for null', async () => {
+		const [statement] = await analyticsFor(postgresDialect()).explain(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				filters: [{ dimension: 'size', op: 'notIn', values: ['large'] }]
+			},
+			ctx
+		)
+
+		expect(statement?.text.match(/CASE WHEN/g)).toHaveLength(1)
+		expect(statement?.text).not.toContain('IS NULL')
+	})
+
+	type Region = { id: string; tenantId: string; name: string }
+	type OrderTag = { orderId: string; tagId: string }
+	type Tag = { id: string; tenantId: string; name: string }
+
+	const order = table<Order>('orders')
+	const region = order.leftJoin(table<Region>('regions'), (r) =>
+		eq(r.col('id'), order.col('regionId'))
+	)
+	const orderTag = table<OrderTag>('order_tags')
+	const tag = orderTag.leftJoin(table<Tag>('tags'), (t) =>
+		eq(t.col('id'), orderTag.col('tagId'))
+	)
+	const lookedUp = defineDataset({
+		key: 'orders',
+		label: 'Orders',
+		description: 'One row per order.',
+		from: order,
+		tenantColumn: order.col('tenantId'),
+		time: { created: { column: order.col('createdAt'), label: 'Created' } },
+		measures: { orders: measure.count({ label: 'Orders' }) },
+		dimensions: {
+			region: dimension.relation({
+				label: 'Region',
+				key: region.col('id'),
+				name: region.col('name'),
+				lookup: { tenantColumn: region.col('tenantId') }
+			}),
+			tag: dimension.manyToMany({
+				label: 'Tag',
+				through: {
+					table: orderTag,
+					on: eq(orderTag.col('orderId'), order.col('id')),
+					key: tag.col('id'),
+					name: tag.col('name')
+				},
+				lookup: { tenantColumn: null }
+			})
+		}
+	})
+
+	test('a lookup reads names from the dimension table, scoped by its own column', async () => {
+		const sql: CompiledStatement[] = []
+		const analytics = createAnalytics({
+			datasets: [lookedUp],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async (statement) => {
+						sql.push(statement)
+						return statement.text.includes('"label"')
+							? [{ key: 'r1', label: 'North' }]
+							: []
+					}
+				}
+			},
+			tenant: (ctx: { tenantId: string }) => ctx.tenantId,
+			now: () => NOW
+		})
+
+		await analytics.query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				filters: [{ dimension: 'region', op: 'in', values: ['north'] }]
+			},
+			ctx
+		)
+
+		const [lookup, query] = sql
+		expect(lookup?.text).toContain('FROM "regions"')
+		expect(lookup?.text).not.toContain('"orders"')
+		expect(lookup?.text).toContain('"regions"."tenantId" = $1')
+		expect(lookup?.values[0]).toBe('tenant-1')
+		expect(query?.values).toContain('r1')
+	})
+
+	test('a shared dimension table is looked up without a tenant', async () => {
+		const sql: string[] = []
+		const analytics = createAnalytics({
+			datasets: [lookedUp],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text }) => {
+						sql.push(text)
+						return [{ key: 't1', label: 'Complaint' }]
+					}
+				}
+			},
+			tenant: (ctx: { tenantId: string }) => ctx.tenantId,
+			now: () => NOW
+		})
+
+		await analytics.query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				filters: [{ dimension: 'tag', op: 'in', values: ['complaint'] }]
+			},
+			ctx
+		)
+
+		expect(sql[0]).toContain('FROM "tags"')
+		expect(sql[0]).not.toContain('order_tags')
+		expect(sql[0]).not.toContain('tenantId')
+	})
+
+	test('a lookup needs the key, the name and the tenant column on one table', () => {
+		expect(() =>
+			dimension.relation({
+				label: 'Region',
+				key: region.col('id'),
+				name: region.col('name'),
+				lookup: { tenantColumn: order.col('tenantId') }
+			})
+		).toThrow('columns of one table')
+	})
+})

@@ -7,7 +7,11 @@ import { bucketStarts } from './period.js'
 import {
 	isKpi,
 	isTimeSeries,
+	OUTPUT_KINDS,
+	pickRenderer,
 	presentDistribution,
+	presentPivot,
+	presentTable,
 	presentKpi,
 	presentLeaderboard,
 	presentTimeseries,
@@ -20,6 +24,8 @@ import {
 
 /** Rows for the current or the previous period, grouped or as totals. */
 type Answer = {
+	/** Answers a grouped statement with one more day row than this, so it is truncated. */
+	limit?: number
 	rows?: Row[]
 	totals?: Row
 	previousRows?: Row[]
@@ -36,6 +42,11 @@ function analyticsAnswering(answer: Answer) {
 					// The previous period of a period starting 2026-10-01 ends there.
 					const previous = values.at(-1) === '2026-10-01T00:00:00.000Z'
 					const grouped = text.includes('"g_')
+					if (grouped && answer.limit)
+						return Array.from({ length: answer.limit + 1 }, (_, day) => ({
+							g_day: bucketStarts('2026-10-01', '2026-12-31', 'day')[day],
+							m_orders: 1
+						}))
 					if (grouped)
 						return (previous ? answer.previousRows : answer.rows) ?? []
 					const totals = previous ? answer.previousTotals : answer.totals
@@ -407,8 +418,16 @@ describe('presentation', () => {
 					key: 'paid',
 					label: 'Settled',
 					points: [
-						{ ts: new Date('2026-10-01T00:00:00.000Z'), value: 2 },
-						{ ts: new Date('2026-10-02T00:00:00.000Z'), value: 0 }
+						{
+							ts: new Date('2026-10-01T00:00:00.000Z'),
+							bucket: '2026-10-01',
+							value: 2
+						},
+						{
+							ts: new Date('2026-10-02T00:00:00.000Z'),
+							bucket: '2026-10-02',
+							value: 0
+						}
 					],
 					chartType: 'line'
 				},
@@ -416,8 +435,16 @@ describe('presentation', () => {
 					key: 'OPEN',
 					label: 'Open',
 					points: [
-						{ ts: new Date('2026-10-01T00:00:00.000Z'), value: 0 },
-						{ ts: new Date('2026-10-02T00:00:00.000Z'), value: 1 }
+						{
+							ts: new Date('2026-10-01T00:00:00.000Z'),
+							bucket: '2026-10-01',
+							value: 0
+						},
+						{
+							ts: new Date('2026-10-02T00:00:00.000Z'),
+							bucket: '2026-10-02',
+							value: 1
+						}
 					],
 					chartType: 'line'
 				}
@@ -516,4 +543,229 @@ describe('presentation', () => {
 			]
 		})
 	})
+})
+
+describe('zero-filled and truncated outputs', () => {
+	test('an ungrouped series exists for a period without rows', async () => {
+		const result = await analyticsAnswering({ rows: [] }).query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['day'],
+				period: week
+			},
+			{}
+		)
+
+		const output = presentTimeseries(result, {
+			bucket: 'day',
+			measure: 'orders'
+		})
+
+		expect(output.series).toHaveLength(1)
+		expect(output.series[0]?.points.map((point) => point.value)).toEqual([
+			0, 0, 0, 0, 0, 0, 0
+		])
+	})
+
+	test('seriesKeys and segmentKeys add zero lanes for keys without rows', async () => {
+		const result = await analyticsAnswering({
+			rows: [{ g_day: '2026-10-01', g_status: 'PAID', m_orders: 2 }],
+			totals: { m_orders: 2 }
+		}).query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['day', 'status'],
+				period: { from: '2026-10-01', to: '2026-10-02' },
+				limit: 100
+			},
+			{}
+		)
+
+		const all = presentTimeseries(result, {
+			bucket: 'day',
+			measure: 'orders',
+			series: 'status',
+			seriesKeys: 'all'
+		})
+		expect(all.series.map((series) => [series.key, series.label])).toEqual([
+			['OPEN', 'Open'],
+			['PAID', 'Paid'],
+			['REFUNDED', 'Refunded']
+		])
+		expect(all.series[0]?.points.map((point) => point.value)).toEqual([0, 0])
+
+		const listed = presentTimeseries(result, {
+			bucket: 'day',
+			measure: 'orders',
+			series: 'status',
+			seriesKeys: ['REFUNDED']
+		})
+		expect(listed.series.map((series) => series.key)).toEqual([
+			'REFUNDED',
+			'PAID'
+		])
+
+		const segments = presentDistribution(result, {
+			by: 'status',
+			measure: 'orders',
+			segmentKeys: 'all'
+		}).segments
+		expect(segments.map((segment) => [segment.key, segment.value])).toEqual([
+			['OPEN', 0],
+			['PAID', 2],
+			['REFUNDED', 0]
+		])
+	})
+
+	test("'all' needs a closed dimension", async () => {
+		const result = await analyticsAnswering({ rows: [] }).query(
+			{ dataset: 'orders', measures: ['orders'], groupBy: ['region'] },
+			{}
+		)
+
+		expect(() =>
+			presentDistribution(result, {
+				by: 'region',
+				measure: 'orders',
+				segmentKeys: 'all'
+			})
+		).toThrow('closed values of region')
+	})
+
+	test('a truncated result says so in its output', async () => {
+		const result = await analyticsAnswering({ limit: 20 }).query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['day'],
+				period: { from: '2026-10-01', to: '2026-12-31' }
+			},
+			{}
+		)
+
+		expect(result.truncated).toBe(true)
+		expect(
+			presentTimeseries(result, { bucket: 'day', measure: 'orders' }).truncated
+		).toBe(true)
+		expect(
+			presentDistribution(result, { by: 'day', measure: 'orders' })
+		).toMatchObject({ truncated: true })
+		expect(
+			presentLeaderboard(result, { by: 'day', measure: 'orders' }).truncated
+		).toBe(true)
+	})
+
+	test('the presenters draw a result without totals', async () => {
+		const result = await analyticsAnswering({
+			rows: [
+				{ g_status: 'PAID', m_orders: 2, m_revenue: 50 },
+				{ g_status: 'OPEN', m_orders: 1, m_revenue: 10 }
+			]
+		}).query(
+			{
+				dataset: 'orders',
+				measures: ['orders', 'revenue'],
+				groupBy: ['status'],
+				totals: false
+			},
+			{}
+		)
+
+		expect(
+			presentDistribution(result, { by: 'status', measure: 'orders' }).total
+		).toBe(3)
+		expect(
+			presentLeaderboard(result, {
+				by: 'status',
+				measure: 'orders',
+				meta: (values) => ({ revenue: values.revenue ?? 0 })
+			}).items[0]
+		).toEqual({
+			rank: 1,
+			id: 'PAID',
+			label: 'Paid',
+			value: 2,
+			meta: { revenue: 50 }
+		})
+		expect(
+			toDistribution(result, { by: 'status', measure: 'orders' }).total
+		).toBeNull()
+	})
+})
+
+describe('pivot and table presenters', () => {
+	const grid = () =>
+		analyticsAnswering({
+			rows: [
+				{ g_weekday: 1, g_hour: 9, m_orders: 2, m_revenue: 20 },
+				{ g_weekday: 2, g_hour: 10, m_orders: 3, m_revenue: 30 },
+				{ g_weekday: 1, g_hour: 10, m_orders: 1, m_revenue: 5 }
+			],
+			totals: { m_orders: 6, m_revenue: 55 }
+		}).query(
+			{
+				dataset: 'orders',
+				measures: ['orders', 'revenue'],
+				groupBy: ['weekday', 'hour'],
+				period: week
+			},
+			{}
+		)
+
+	test('presentPivot draws a grid by label, with sums when asked', async () => {
+		expect(
+			presentPivot(await grid(), {
+				rows: 'weekday',
+				columns: 'hour',
+				measure: 'orders',
+				totals: true
+			})
+		).toEqual({
+			kind: 'pivot',
+			rowDimension: { key: 'weekday', label: 'Weekday' },
+			columnDimension: { key: 'hour', label: 'Hour' },
+			rows: ['Monday', 'Tuesday'],
+			columns: ['09:00', '10:00'],
+			values: [
+				[2, 1],
+				[0, 3]
+			],
+			totals: { rowTotals: [3, 3], columnTotals: [2, 4], grandTotal: 6 }
+		})
+	})
+
+	test('presentTable has a column per grouped dimension and measure', async () => {
+		const table = presentTable(await grid(), {
+			columns: ['weekday', 'orders'],
+			labels: { orders: 'Count' }
+		})
+
+		expect(table).toEqual({
+			kind: 'table',
+			columns: [
+				{ key: 'weekday', label: 'Weekday', type: 'number' },
+				{ key: 'orders', label: 'Count', type: 'number', nullable: false }
+			],
+			rows: [
+				{ weekday: 1, orders: 2 },
+				{ weekday: 2, orders: 3 },
+				{ weekday: 1, orders: 1 }
+			]
+		})
+		expect(
+			presentTable(await grid()).columns.map((column) => column.key)
+		).toEqual(['weekday', 'hour', 'orders', 'revenue'])
+	})
+})
+
+test('pickRenderer covers every kind and falls back for an unknown one', () => {
+	const map = Object.fromEntries(
+		OUTPUT_KINDS.map((kind) => [kind, kind])
+	) as Record<(typeof OUTPUT_KINDS)[number], string>
+
+	expect(pickRenderer(map, { kind: 'pivot' }, 'none')).toBe('pivot')
+	expect(pickRenderer(map, { kind: 'gauge' }, 'none')).toBe('none')
+	expect(pickRenderer(map, { kind: 'toString' }, 'none')).toBe('none')
 })

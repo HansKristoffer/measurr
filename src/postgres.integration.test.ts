@@ -12,10 +12,18 @@ import {
 	AnalyticsError,
 	AnalyticsResultSchema,
 	allTenants,
-	createAnalytics
+	caseWhen,
+	createAnalytics,
+	defineDataset,
+	dimension,
+	eq,
+	gte,
+	measure,
+	table
 } from './index.js'
 import { postgresDialect } from './dialects/postgres.js'
 import {
+	type Order,
 	type RegionId,
 	maintenance,
 	orderBook,
@@ -597,7 +605,7 @@ describe.skipIf(!url)('postgres integration', () => {
 		expect(chunks.at(-1)?.done).toBe(true)
 
 		const byKey = new Map(chunks.map((chunk) => [chunk.key, chunk.result]))
-		expect(byKey.get('orders.count')).toEqual({
+		expect(byKey.get('orders.count')).toMatchObject({
 			current: { kind: 'kpi', value: 4, label: 'Orders' },
 			previous: { kind: 'kpi', value: 1, label: 'Orders' },
 			supportsTimeRange: true
@@ -620,6 +628,86 @@ describe.skipIf(!url)('postgres integration', () => {
 			).series[0]?.points.map((point) => point.ts)
 		expect(days(trend?.current)).toHaveLength(30)
 		expect(days(trend?.previous)).toEqual(days(trend?.current))
+	})
+
+	test('lookups on the dimension table, notIn on a computed value, totals: false', async () => {
+		type Region = { id: RegionId; tenantId: string; name: string }
+		const order = table<Order>('orders')
+		const region = order.leftJoin(table<Region>('regions'), (r) =>
+			eq(r.col('id'), order.col('regionId'))
+		)
+		const lookedUp = defineDataset({
+			key: 'orders',
+			label: 'Orders',
+			description: 'One row per order.',
+			from: order,
+			tenantColumn: order.col('tenantId'),
+			scope: eq(order.col('isTest'), false),
+			time: { created: { column: order.col('createdAt'), label: 'Created' } },
+			measures: { orders: measure.count({ label: 'Orders' }) },
+			dimensions: {
+				size: dimension.computed({
+					label: 'Size',
+					expr: caseWhen(
+						[
+							[gte(order.col('amount'), 1000), 'large'],
+							[gte(order.col('amount'), 100), 'medium']
+						],
+						'small'
+					),
+					values: { large: 'Large', medium: 'Medium', small: 'Small' }
+				}),
+				region: dimension.relation({
+					label: 'Region',
+					key: region.col('id'),
+					name: region.col('name'),
+					lookup: { tenantColumn: region.col('tenantId') }
+				})
+			}
+		})
+		const scoped = createAnalytics({
+			datasets: [lookedUp],
+			sources: { main: source },
+			tenant: (ctx: { tenantId: string }) => ctx.tenantId,
+			now: () => NOW
+		})
+
+		const north = await scoped.query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				filters: [{ dimension: 'region', op: 'in', values: ['NORTH'] }]
+			},
+			tenantA
+		)
+		expect(north.totals.orders).toBe(2)
+		// East belongs to tenant B, so tenant A's lookup does not find it.
+		await expect(
+			scoped.query(
+				{
+					dataset: 'orders',
+					measures: ['orders'],
+					filters: [{ dimension: 'region', op: 'in', values: ['East'] }]
+				},
+				tenantA
+			)
+		).rejects.toMatchObject({ code: 'unknown_value' })
+
+		const bySize = await scoped.query(
+			{
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['size'],
+				filters: [{ dimension: 'size', op: 'notIn', values: ['large'] }],
+				totals: false
+			},
+			tenantA
+		)
+		expect(bySize.rows.map((row) => [row.size.key, row.orders])).toEqual([
+			['medium', 2],
+			['small', 1]
+		])
+		expect('totals' in bySize).toBe(false)
 	})
 
 	test('a role outside the metric is denied, not run', async () => {

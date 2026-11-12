@@ -1,5 +1,6 @@
 /**
- * The contract test kit: the same checks for every dataset, run against a seeded database.
+ * The contract test kit: the same checks for every dataset, run against a seeded database,
+ * and for every metric of a registry.
  * Framework-free: `checkDatasetContract` returns a report and `assertDatasetContract` throws
  * with every failure listed, so it works from `bun:test`, vitest or a script.
  */
@@ -15,6 +16,7 @@ import {
 	dimension,
 	measure
 } from './dataset.js'
+import type { AnyMetric, MetricRegistry } from './metrics.js'
 import type { PeriodInput } from './period.js'
 import { type Tenant, type TenantId, allTenants } from './plan.js'
 import { MAX_MEASURES } from './query.js'
@@ -308,6 +310,67 @@ export async function assertDatasetContract(
 		throw new Error(
 			`Dataset ${options.dataset.key} breaks the contract:\n${lines.join('\n')}`
 		)
+	}
+
+	return report
+}
+
+export type MetricContractOptions<Ctx> = {
+	/** Anything with the registry's `metrics`, `keys` and `run`. */
+	registry: Pick<MetricRegistry<readonly AnyMetric[], Ctx>, 'metrics' | 'run'>
+	/** A caller `canRun` allows every metric for, with seeded rows in its scope. */
+	ctx: Ctx
+	/** Defaults to the last 30 days. */
+	period?: PeriodInput
+}
+
+/**
+ * Runs every metric of a registry once, comparing with the previous period, and checks that
+ * none fails, that each draws its own `kind`, and that a metric over a time range has a
+ * previous period while a snapshot has none.
+ */
+export async function checkMetricContract<Ctx>(
+	options: MetricContractOptions<Ctx>
+): Promise<ContractReport> {
+	const { registry } = options
+	const chunks = await Array.fromAsync(
+		registry.run(
+			{
+				metrics: registry.metrics.map((metric) => ({ key: metric.key })),
+				period: options.period ?? { last: { days: 30 } },
+				compareToPrevious: true
+			},
+			options.ctx
+		)
+	)
+	const checks = registry.metrics.map((metric): ContractCheck => {
+		const chunk = chunks.find((entry) => entry.key === metric.key)
+		const name = `metric ${metric.key}`
+		const fail = (message: string) => ({ name, ok: false, message })
+		if (!chunk) return fail('gave no result')
+		if (chunk.error !== undefined) return fail(`${chunk.code}: ${chunk.error}`)
+		const { current, previous } = chunk.result
+		if (current.kind !== metric.kind)
+			return fail(`drew a ${current.kind}, not a ${metric.kind}`)
+		if (metric.supportsTimeRange && previous?.kind !== metric.kind)
+			return fail('has no previous period of its kind')
+		if (!metric.supportsTimeRange && previous)
+			return fail('is a snapshot but has a previous period')
+		return { name, ok: true, message: undefined }
+	})
+
+	return { ok: checks.every((entry) => entry.ok), checks }
+}
+
+/** Runs `checkMetricContract` and throws with every failed check listed. */
+export async function assertMetricContract<Ctx>(
+	options: MetricContractOptions<Ctx>
+): Promise<ContractReport> {
+	const report = await checkMetricContract(options)
+	const failed = report.checks.filter((entry) => !entry.ok)
+	if (failed.length > 0) {
+		const lines = failed.map((entry) => `- ${entry.name}: ${entry.message}`)
+		throw new Error(`The metrics break the contract:\n${lines.join('\n')}`)
 	}
 
 	return report

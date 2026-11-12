@@ -25,6 +25,7 @@ import {
 	shapeRows
 } from './plan.js'
 import {
+	type PeriodInput,
 	PeriodError,
 	type ResolvedPeriod,
 	isValidTimezone,
@@ -34,10 +35,13 @@ import {
 import {
 	type DatasetQuery,
 	type QueryResult,
+	type ResultFields,
 	type ResultOf,
 	type ResultPeriod,
+	type ResultWithoutTotals,
 	buildQuerySchema,
-	datasetResultSchema
+	datasetResultSchema,
+	periodSchema
 } from './query.js'
 
 export type Row = Record<string, unknown>
@@ -45,8 +49,22 @@ export type Row = Record<string, unknown>
 /** A database: a dialect to compile with and a function that runs the compiled SQL. */
 export type AnalyticsSource = {
 	readonly dialect: Dialect
-	/** Runs one read-only statement and returns its rows as plain objects. */
-	execute(statement: CompiledStatement): Promise<readonly Row[]>
+	/**
+	 * Runs one read-only statement and returns its rows as plain objects. `signal` aborts when
+	 * the caller gives up (a closed stream), so a driver that supports it can cancel.
+	 */
+	execute(
+		statement: CompiledStatement,
+		options?: { signal?: AbortSignal | undefined }
+	): Promise<readonly Row[]>
+}
+
+/** Per call: a signal that cancels the query, and the metric it runs for. */
+export type QueryOptions = {
+	/** Aborting rejects the query with the signal's reason and stops its statements. */
+	signal?: AbortSignal | undefined
+	/** The metric the query runs for; `onQuery` and the cache hear it. */
+	metric?: string | undefined
 }
 
 export type AnalyticsErrorCode =
@@ -113,6 +131,8 @@ export function isAnalyticsError<
 export type AnalyticsQueryEvent = {
 	/** The dataset asked for; null when the input named no known dataset. */
 	dataset: string | null
+	/** The metric the query ran for, when a metric registry ran it. */
+	metric?: string
 	durationMs: number
 	/** Rows returned; 0 on error. */
 	rows: number
@@ -234,13 +254,24 @@ export type AnalyticsOptions<DS extends readonly AnyDataset[], Ctx> = {
 	/** The clock periods and `minutesAgo` resolve against. */
 	now?: (() => Date) | undefined
 	/**
+	 * The highest `limit` `query` accepts, for app code such as a long time series. The schemas
+	 * `querySchema` gives a model keep 100. Defaults to 100.
+	 */
+	maxLimit?: number | undefined
+	/**
+	 * How many statements run at once on each source, so a large dashboard cannot take every
+	 * pooled connection. Unlimited when omitted.
+	 */
+	concurrency?: number | undefined
+	/**
 	 * Called once per `query`, after it succeeds or fails: for metrics and logs. What it
 	 * throws or rejects with is swallowed, so it can never fail a query.
 	 */
 	onQuery?: ((event: AnalyticsQueryEvent, ctx: Ctx) => unknown) | undefined
 	/**
 	 * Where finished results are kept and looked up. What it throws or rejects with is
-	 * swallowed: a failing cache is a miss, never a failed query.
+	 * swallowed: a failing cache is a miss, never a failed query. With a cache, identical
+	 * queries that run at the same time also share one run.
 	 */
 	cache?: AnalyticsCache<Ctx, DS[number]['key']> | undefined
 	/**
@@ -264,13 +295,21 @@ export type AnalyticsCache<Ctx, Key extends string = string> = {
 	 * caller (a refresh button); its fresh result is still stored. A stored value that is not a
 	 * result of this dataset counts as a miss, so a changed definition does not break queries.
 	 */
-	get(key: string, entry: { dataset: Key; ctx: Ctx }): unknown
-	/** Stores a result; pick the time to live per `dataset`. */
+	get(key: string, entry: CacheEntry<Ctx, Key>): unknown
+	/** Stores a result; pick the time to live per `dataset` (or per `metric`). */
 	set(
 		key: string,
-		result: QueryResult<Row, Row>,
-		entry: { dataset: Key; ctx: Ctx }
+		result: QueryResult<Row, Row> | ResultWithoutTotals<Row>,
+		entry: CacheEntry<Ctx, Key>
 	): unknown
+}
+
+/** What the cache is told about a result besides its key. */
+export type CacheEntry<Ctx, Key extends string = string> = {
+	dataset: Key
+	ctx: Ctx
+	/** The metric the query runs for, when a metric registry runs it. */
+	metric?: string
 }
 
 export type DatasetCatalogEntry<Key extends string = string> = {
@@ -302,7 +341,8 @@ export type Analytics<DS extends readonly AnyDataset[], Ctx> = {
 	/** Parses, authorizes, plans, compiles, runs and shapes one query. */
 	query<const Q extends DatasetQuery<DS[number]>>(
 		input: Q,
-		ctx: Ctx
+		ctx: Ctx,
+		options?: QueryOptions
 	): Promise<ResultOf<DS[number], Q>>
 	/** The compiled statements a query would run, without running them or resolving labels. */
 	explain(
@@ -331,6 +371,16 @@ export type Analytics<DS extends readonly AnyDataset[], Ctx> = {
 	 * when it has none. Rejects with `invalid_timezone` for a name the runtime does not know.
 	 */
 	timezone(ctx: Ctx): Promise<string>
+	/**
+	 * A period in `ctx`'s timezone: its local days and the instants they start and end at, or
+	 * null for all time. Rejects with `invalid_period` as `query` would.
+	 */
+	period(input: PeriodInput, ctx: Ctx): Promise<ResolvedPeriod | null>
+	/**
+	 * The tenant scope every query for `ctx` gets, for code that reads the same rows another
+	 * way (Prisma, another database). Rejects with `missing_tenant` as `query` would.
+	 */
+	scope(ctx: Ctx): Tenant
 	/** The datasets `ctx` may query, with the measures and dimensions it may use. */
 	listDatasets(ctx: Ctx): Promise<DatasetCatalogEntry<DS[number]['key']>[]>
 }
@@ -341,7 +391,20 @@ export type AnalyticsQuery<A> =
 export type AnalyticsResult<A, Q> =
 	A extends Analytics<infer DS, never> ? ResultOf<DS[number], Q> : never
 
-type ShapedResult = QueryResult<Row, Row>
+/** A result as the engine builds it: `totals` absent for `totals: false`. */
+type ShapedResult = {
+	period: ResultPeriod
+	rows: Row[]
+	totals?: Row
+	previous?: {
+		period: Extract<ResultPeriod, { from: string }>
+		rows: Row[]
+		totals?: Row
+	}
+	notes: string[]
+	truncated: boolean
+	fields?: ResultFields
+}
 
 // biome-ignore lint/suspicious/noExplicitAny: resolvers are typed per dataset where they are declared.
 type AnyResolver = (input: any) => ResolverOutput | Promise<ResolverOutput>
@@ -373,6 +436,8 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	const byKey = new Map<string, AnyDataset>()
 	const sourceOf = new Map<string, AnalyticsSource>()
 	const restrictedOf = new Map<string, RestrictedField[]>()
+	/** A hash of each definition, so a deploy that changes a measure misses the cache. */
+	const fingerprints = new Map<string, Promise<string>>()
 
 	for (const dataset of datasets) {
 		if (byKey.has(dataset.key))
@@ -381,7 +446,13 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 
 		const source = resolveSource(dataset, options.sources, sourceNames)
 		sourceOf.set(dataset.key, source)
-		compileEverything(dataset, source.dialect)
+		const compiled = compileEverything(dataset, source.dialect)
+		if (options.cache) {
+			fingerprints.set(
+				dataset.key,
+				sha256(compiled + stableJson(catalogEntry(dataset)))
+			)
+		}
 
 		const restricted = restrictedFields(dataset)
 		if (restricted.length > 0 && !options.authorizeField) {
@@ -422,6 +493,36 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	const now = options.now ?? (() => new Date())
 	const querySchemas = new Map<string, z.ZodType>()
 	const resultSchemas = new Map<string, z.ZodType>()
+	// What `query` parses: every dataset, the app-only fields, and the app's `maxLimit`.
+	const parseSchema = buildQuerySchema(datasets, {
+		parse: true,
+		maxLimit: options.maxLimit
+	})
+	const limiters = new Map<AnalyticsSource, Acquire>()
+	if (options.concurrency !== undefined) {
+		for (const source of new Set(Object.values(options.sources)))
+			limiters.set(source, semaphore(options.concurrency))
+	}
+	/** Runs in flight by cache key, so identical queries at the same time share one run. */
+	const inFlight = new Map<string, Shared<ShapedResult>>()
+
+	/** Runs one statement within the source's concurrency, unless `signal` has aborted. */
+	const execute = async (
+		source: AnalyticsSource,
+		statement: CompiledStatement,
+		signal: AbortSignal | undefined
+	) => {
+		signal?.throwIfAborted()
+		const release = await limiters.get(source)?.(signal)
+		try {
+			signal?.throwIfAborted()
+			return await (signal
+				? source.execute(statement, { signal })
+				: source.execute(statement))
+		} finally {
+			release?.()
+		}
+	}
 
 	const datasetOf = (key: string): AnyDataset => {
 		const dataset = byKey.get(key)
@@ -524,6 +625,44 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		return querySchemaFor(allowed)
 	}
 
+	const scopeOf = (ctx: Ctx): Tenant => {
+		const tenant: unknown = options.tenant(ctx)
+		if (!isTenant(tenant)) {
+			throw new AnalyticsError(
+				'missing_tenant',
+				'Refusing to query without a tenant'
+			)
+		}
+		return tenant
+	}
+
+	const resolveIn = (
+		input: PeriodInput,
+		timezone: string,
+		at: Date
+	): ResolvedPeriod | null => {
+		if ('all' in input) return null
+		try {
+			return resolvePeriod(input, timezone, at)
+		} catch (error) {
+			if (error instanceof PeriodError) {
+				throw new AnalyticsError('invalid_period', error.message)
+			}
+			throw error
+		}
+	}
+
+	const periodOf = async (input: PeriodInput, ctx: Ctx) => {
+		const parsed = periodSchema.safeParse(input)
+		if (!parsed.success) {
+			throw new AnalyticsError(
+				'invalid_period',
+				`Invalid period: ${z.prettifyError(parsed.error)}`
+			)
+		}
+		return resolveIn(parsed.data, await timezoneOf(ctx), now())
+	}
+
 	/** Parse, authorize, and resolve everything that comes from hooks. */
 	const timezoneOf = async (ctx: Ctx) => {
 		const timezone = (await options.timezone?.(ctx)) || 'UTC'
@@ -537,7 +676,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	}
 
 	const prepare = async (input: unknown, ctx: Ctx): Promise<Prepared> => {
-		const parsed = querySchemaFor(datasets).safeParse(input)
+		const parsed = parseSchema.safeParse(input)
 		if (!parsed.success) {
 			throw new AnalyticsError(
 				'invalid_query',
@@ -573,13 +712,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 			)
 		}
 
-		const tenant: unknown = options.tenant(ctx)
-		if (!isTenant(tenant)) {
-			throw new AnalyticsError(
-				'missing_tenant',
-				'Refusing to query without a tenant'
-			)
-		}
+		const tenant = scopeOf(ctx)
 		// Never drop a narrower scope: rows without a tenant are only for every-tenant callers.
 		if (!dataset.tenantColumn && tenant !== allTenants) {
 			throw new AnalyticsError(
@@ -591,16 +724,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		const timezone = await timezoneOf(ctx)
 		const query = normalizeQuery(dataset, parsedQuery)
 		const at = now()
-		let period: ResolvedPeriod | null
-		try {
-			period =
-				'all' in query.period ? null : resolvePeriod(query.period, timezone, at)
-		} catch (error) {
-			if (error instanceof PeriodError) {
-				throw new AnalyticsError('invalid_period', error.message)
-			}
-			throw error
-		}
+		const period = resolveIn(query.period, timezone, at)
 		// The schema refuses compareToPrevious with an all-time period.
 		const previous =
 			query.compareToPrevious && period ? previousPeriod(period) : null
@@ -610,13 +734,14 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 
 	const runQuery = async (
 		prepared: Prepared,
-		ctx: Ctx
+		ctx: Ctx,
+		signal: AbortSignal | undefined
 	): Promise<ShapedResult> => {
 		const { dataset, query, tenant, timezone, period, previous, now } = prepared
 		const source = sourceFor(dataset)
 		const { dialect } = source
 		const run = (statement: SelectStatement) =>
-			source.execute(dialect.compile(statement))
+			execute(source, dialect.compile(statement), signal)
 
 		const resolvedValues = await resolveOpenValues(
 			dataset,
@@ -648,7 +773,9 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				rawRows,
 				dialect
 			)
-			const totalsRow = (rawTotals ?? rawRows)[0] ?? {}
+			// Without a totals statement, a grouped query's totals stay empty (and unreturned).
+			const grouped = query.groupBy.length > 0
+			const totalsRow = (rawTotals ?? (grouped ? [] : rawRows))[0] ?? {}
 			const totals = shapeMeasures(dataset, query.measures, totalsRow, dialect)
 
 			for (const key of query.measures) {
@@ -696,7 +823,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				totals[key] = value(output.totals)
 			}
 
-			return { rows, totals, truncated }
+			return { rows, ...(query.totals && { totals }), truncated }
 		}
 
 		const [current, before] = await Promise.all([
@@ -705,14 +832,14 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				runPeriod(previous).then(({ rows, totals }) => ({
 					period: range(previous),
 					rows,
-					totals
+					...(totals && { totals })
 				}))
 		])
 
 		return {
 			period: period ? range(period) : { all: true, timezone },
 			rows: current.rows,
-			totals: current.totals,
+			...(current.totals && { totals: current.totals }),
 			...(before && { previous: before }),
 			notes: resultNotes(dataset, query),
 			truncated: current.truncated
@@ -737,7 +864,7 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 	/** The cached result, or null; a failing or malformed cache entry is a miss. */
 	const cachedResult = async (
 		key: string,
-		entry: { dataset: string; ctx: Ctx }
+		entry: CacheEntry<Ctx>
 	): Promise<ShapedResult | null> => {
 		try {
 			const value = await options.cache?.get(key, entry)
@@ -749,38 +876,61 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 		}
 	}
 
-	const store = (
-		key: string,
-		result: ShapedResult,
-		entry: { dataset: string; ctx: Ctx }
-	) => {
+	const store = (key: string, result: ShapedResult, entry: CacheEntry<Ctx>) => {
 		try {
-			Promise.resolve(options.cache?.set(key, result, entry)).catch(() => {})
+			Promise.resolve(
+				options.cache?.set(key, result as QueryResult<Row, Row>, entry)
+			).catch(() => {})
 		} catch {
 			// A cache that cannot store is a slower query, not a failed one.
 		}
 	}
 
-	const query = async (input: unknown, ctx: Ctx): Promise<ShapedResult> => {
+	const query = async (
+		input: unknown,
+		ctx: Ctx,
+		queryOptions: QueryOptions = {}
+	): Promise<ShapedResult> => {
+		const { signal, metric } = queryOptions
 		const startedAt = performance.now()
 		const dataset = datasetKeyOf(input)
 		const durationMs = () => Math.round(performance.now() - startedAt)
 		let cache: AnalyticsQueryEvent['cache']
 
 		try {
+			signal?.throwIfAborted()
 			const prepared = await prepare(input, ctx)
-			const entry = { dataset: prepared.dataset.key, ctx }
-			const key = options.cache && (await cacheKey(prepared))
+			const entry: CacheEntry<Ctx> = {
+				dataset: prepared.dataset.key,
+				ctx,
+				...(metric !== undefined && { metric })
+			}
+			const fingerprint = fingerprints.get(prepared.dataset.key)
+			const key =
+				options.cache && fingerprint
+					? await cacheKey(prepared, await fingerprint)
+					: null
 			let result = key ? await cachedResult(key, entry) : null
 			if (key) cache = result ? 'hit' : 'miss'
 			if (!result) {
-				result = await runQuery(prepared, ctx)
-				if (key) store(key, result, entry)
+				result = key
+					? await share(
+							inFlight,
+							key,
+							async (shared) => {
+								const fresh = await runQuery(prepared, ctx, shared)
+								store(key, fresh, entry)
+								return fresh
+							},
+							signal
+						)
+					: await runQuery(prepared, ctx, signal)
 			}
 
 			report(
 				{
 					dataset,
+					...(metric !== undefined && { metric }),
 					durationMs: durationMs(),
 					rows: result.rows.length,
 					outcome: 'success',
@@ -788,11 +938,15 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				},
 				ctx
 			)
-			return result
+			return {
+				...result,
+				fields: resultFields(prepared.dataset, prepared.query)
+			}
 		} catch (error) {
 			report(
 				{
 					dataset,
+					...(metric !== undefined && { metric }),
 					durationMs: durationMs(),
 					rows: 0,
 					outcome: 'error',
@@ -841,8 +995,11 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
 				: querySchemaFor(
 						schemaOptions?.datasets?.map(datasetOf) ?? datasets
 					)) as Analytics<DS, Ctx>['querySchema'],
-		resultSchema: (key) => resultSchemaFor(key) as z.ZodType<ShapedResult>,
+		resultSchema: (key) =>
+			resultSchemaFor(key) as z.ZodType<QueryResult<Row, Row>>,
 		timezone: timezoneOf,
+		period: periodOf,
+		scope: scopeOf,
 		listDatasets: async (ctx) =>
 			(await allowedDatasets(ctx)).map(
 				(dataset) =>
@@ -855,7 +1012,10 @@ export function createAnalytics<const DS extends readonly AnyDataset[], Ctx>(
  * The cache key of a prepared query: its dataset, then a SHA-256 of everything that decides
  * the result. Resolved days are part of it, so `last 30 days` moves on at local midnight.
  */
-async function cacheKey(prepared: Prepared): Promise<string> {
+async function cacheKey(
+	prepared: Prepared,
+	fingerprint: string
+): Promise<string> {
 	const { dataset, query, tenant, timezone, period, previous } = prepared
 	const days = (target: ResolvedPeriod | null) =>
 		target && [target.from, target.to]
@@ -866,21 +1026,110 @@ async function cacheKey(prepared: Prepared): Promise<string> {
 				? [...new Set(tenant.map((id) => JSON.stringify(id)))].sort()
 				: tenant
 	const text = stableJson({
+		definition: fingerprint,
 		query,
 		tenant: scope,
 		timezone,
 		period: days(period),
 		previous: days(previous)
 	})
+
+	return `measurr:${dataset.key}:${await sha256(text)}`
+}
+
+async function sha256(text: string): Promise<string> {
 	const digest = await crypto.subtle.digest(
 		'SHA-256',
 		new TextEncoder().encode(text)
 	)
-	const hex = Array.from(new Uint8Array(digest), (byte) =>
+	return Array.from(new Uint8Array(digest), (byte) =>
 		byte.toString(16).padStart(2, '0')
 	).join('')
+}
 
-	return `measurr:${dataset.key}:${hex}`
+type Acquire = (signal: AbortSignal | undefined) => Promise<() => void>
+
+/** At most `max` holders at once; the rest wait in order, and leave the queue on abort. */
+function semaphore(max: number): Acquire {
+	if (!Number.isInteger(max) || max < 1)
+		throw new Error(
+			`concurrency must be a whole number of at least 1, not ${max}`
+		)
+	let active = 0
+	const queue: (() => void)[] = []
+	const release = () => {
+		const next = queue.shift()
+		if (next) next()
+		else active--
+	}
+
+	return async (signal) => {
+		if (active < max) {
+			active++
+			return release
+		}
+		await new Promise<void>((resolve, reject) => {
+			const onAbort = () => {
+				queue.splice(queue.indexOf(wake), 1)
+				reject(signal?.reason)
+			}
+			const wake = () => {
+				signal?.removeEventListener('abort', onAbort)
+				resolve()
+			}
+			queue.push(wake)
+			signal?.addEventListener('abort', onAbort, { once: true })
+		})
+		return release
+	}
+}
+
+type Shared<T> = {
+	promise: Promise<T>
+	controller: AbortController
+	waiting: number
+}
+
+/**
+ * One run of `start` for every caller that asks for `key` while it is in flight. A caller's
+ * abort rejects only its own wait; the run stops when every caller has aborted.
+ */
+function share<T>(
+	inFlight: Map<string, Shared<T>>,
+	key: string,
+	start: (signal: AbortSignal) => Promise<T>,
+	signal: AbortSignal | undefined
+): Promise<T> {
+	let entry = inFlight.get(key)
+	if (!entry) {
+		const controller = new AbortController()
+		const created: Shared<T> = {
+			controller,
+			waiting: 0,
+			promise: start(controller.signal).finally(() => {
+				if (inFlight.get(key) === created) inFlight.delete(key)
+			})
+		}
+		inFlight.set(key, created)
+		entry = created
+	}
+	const shared = entry
+	shared.waiting++
+	if (!signal) return shared.promise
+
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			if (--shared.waiting === 0) {
+				if (inFlight.get(key) === shared) inFlight.delete(key)
+				shared.controller.abort(signal.reason)
+			}
+			reject(signal.reason)
+		}
+		signal.addEventListener('abort', onAbort, { once: true })
+		shared.promise.then(resolve, reject).finally(() => {
+			signal.removeEventListener('abort', onAbort)
+		})
+	})
 }
 
 /** JSON with object keys sorted, so equal values give equal text. */
@@ -914,17 +1163,27 @@ function isTenantId(value: unknown): value is TenantId {
 	)
 }
 
-/** The statement for a period's rows, and for its totals when the query groups. */
+/**
+ * The statement for a period's rows, and for its totals when the query groups and wants them
+ * (or a resolved measure needs them).
+ */
 function periodStatements(
 	dataset: AnyDataset,
 	query: NormalizedQuery,
 	context: PlanContext
 ) {
 	const grouped = query.groupBy.length > 0
+	const resolved = query.measures.some(
+		(key) =>
+			(dataset.measures[key] as AnyMeasure | undefined)?.kind === 'resolved'
+	)
 
 	return {
 		rows: planQuery(dataset, query, context, true),
-		totals: grouped ? planQuery(dataset, query, context, false) : null
+		totals:
+			grouped && (query.totals || resolved)
+				? planQuery(dataset, query, context, false)
+				: null
 	}
 }
 
@@ -952,7 +1211,7 @@ function resolveSource(
  * Compiles every measure, grouping and filter once, so a definition the dialect cannot render
  * fails when the app starts instead of on the first query.
  */
-function compileEverything(dataset: AnyDataset, dialect: Dialect): void {
+function compileEverything(dataset: AnyDataset, dialect: Dialect): string {
 	const now = new Date(0)
 	const context: PlanContext = {
 		tenant: dataset.tenantColumn ? 'tenant' : allTenants,
@@ -963,17 +1222,19 @@ function compileEverything(dataset: AnyDataset, dialect: Dialect): void {
 	}
 	const measures = Object.keys(dataset.measures)
 	const base = normalizeQuery(dataset, { dataset: dataset.key, measures })
+	const texts: string[] = []
+	const compile = (statement: SelectStatement) => {
+		texts.push(dialect.compile(statement).text)
+	}
 
 	try {
-		dialect.compile(planQuery(dataset, base, context, true))
+		compile(planQuery(dataset, base, context, true))
 
 		for (const [key, dimension] of Object.entries<AnyDimension>(
 			dataset.dimensions
 		)) {
 			if (dimension.groupable) {
-				dialect.compile(
-					planQuery(dataset, { ...base, groupBy: [key] }, context, true)
-				)
+				compile(planQuery(dataset, { ...base, groupBy: [key] }, context, true))
 			}
 			if (dimension.filterable) {
 				const filter =
@@ -987,7 +1248,7 @@ function compileEverything(dataset: AnyDataset, dialect: Dialect): void {
 									to: '2000-01-02'
 								}
 							: { dimension: key, op: 'in' as const, values: ['value'] }
-				dialect.compile(
+				compile(
 					planQuery(dataset, { ...base, filters: [filter] }, context, true)
 				)
 			}
@@ -998,6 +1259,7 @@ function compileEverything(dataset: AnyDataset, dialect: Dialect): void {
 			`Dataset ${dataset.key} does not compile for ${dialect.name}: ${message}`
 		)
 	}
+	return texts.join('\n')
 }
 
 /**
@@ -1146,12 +1408,7 @@ function catalogEntry(dataset: AnyDataset): DatasetCatalogEntry {
 				key,
 				label: entry.label,
 				description: entry.description,
-				valueType:
-					entry.kind !== 'aggregate'
-						? 'ratio'
-						: entry.node.fn === 'count' || entry.node.fn === 'countDistinct'
-							? 'count'
-							: 'number'
+				valueType: entry.result
 			})
 		),
 		dimensions: Object.entries<AnyDimension>(dataset.dimensions).map(
@@ -1163,14 +1420,38 @@ function catalogEntry(dataset: AnyDataset): DatasetCatalogEntry {
 				category: entry.category,
 				groupable: entry.groupable,
 				filterable: entry.filterable,
-				values:
-					entry.kind === 'enum' || entry.kind === 'computed'
-						? Object.entries(entry.values).map(([value, label]) => ({
-								key: value,
-								label
-							}))
-						: undefined
+				values: closedValues(entry)
 			})
 		)
+	}
+}
+
+function closedValues(dimension: AnyDimension) {
+	return dimension.kind === 'enum' || dimension.kind === 'computed'
+		? Object.entries(dimension.values).map(([key, label]) => ({ key, label }))
+		: undefined
+}
+
+/** What a result's keys are, from the definitions: grouped dimensions, then measures. */
+function resultFields(
+	dataset: AnyDataset,
+	query: NormalizedQuery
+): ResultFields {
+	return {
+		groupBy: query.groupBy.map((key) => {
+			const dimension: AnyDimension = dataset.dimensions[key]
+			const values = closedValues(dimension)
+			return {
+				key,
+				label: dimension.label,
+				kind: dimension.kind,
+				...(dimension.kind === 'timeBucket' && { unit: dimension.unit }),
+				...(values && { values })
+			}
+		}),
+		measures: query.measures.map((key) => {
+			const entry: AnyMeasure = dataset.measures[key]
+			return { key, label: entry.label, valueType: entry.result }
+		})
 	}
 }

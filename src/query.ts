@@ -5,9 +5,11 @@ import type {
 	AnyMeasure,
 	Dataset,
 	DimensionValue,
+	MeasureResult,
 	MeasureValue,
 	SqlMeasureKey
 } from './dataset.js'
+import type { TimeBucketUnit } from './expr.js'
 import {
 	MAX_PERIOD_DAYS,
 	type PeriodInput,
@@ -86,6 +88,11 @@ export type DatasetQuery<DS> =
 					  }
 					| undefined
 				limit?: number | undefined
+				/**
+				 * False skips the ungrouped totals statement of a grouped query; the result then has
+				 * no `totals`. Not offered to models (`querySchema` leaves it out). Defaults to true.
+				 */
+				totals?: boolean | undefined
 			}
 		: never
 
@@ -126,6 +133,31 @@ type PeriodShape<P> = P extends { all: true }
 	? Extract<ResultPeriod, { all: true }>
 	: Exclude<ResultPeriod, { all: true }>
 
+/** A grouped dimension of a result, as the dataset describes it. */
+export type ResultGroupField = {
+	key: string
+	label: string
+	kind: AnyDimension['kind']
+	/** For a time bucket: what one bucket is. */
+	unit?: TimeBucketUnit
+	/** For an enum or computed dimension: every value it can have, in definition order. */
+	values?: { key: string; label: string }[]
+}
+
+/** A measure of a result, as the dataset describes it. */
+export type ResultMeasureField = {
+	key: string
+	label: string
+	/** `count`: a whole number, never null. `ratio`: 0-1. `number`: the rest. */
+	valueType: MeasureResult
+}
+
+/** What a result's row keys are: its grouped dimensions and its measures, in query order. */
+export type ResultFields = {
+	groupBy: ResultGroupField[]
+	measures: ResultMeasureField[]
+}
+
 export type QueryResult<
 	Row,
 	Totals,
@@ -141,17 +173,47 @@ export type QueryResult<
 		totals: Totals
 	}
 	notes: string[]
+	/** Whether the period's rows were cut at the query's `limit`. */
 	truncated: boolean
+	fields: ResultFields
 }
+
+/** What a query with `totals: false` returns: no totals for either period. */
+export type ResultWithoutTotals<
+	Row,
+	Period extends ResultPeriod = ResultPeriod
+> = Omit<QueryResult<Row, never, Period>, 'totals' | 'previous'> & {
+	previous?: {
+		period: { from: string; to: string; timezone: string }
+		rows: Row[]
+	}
+}
+
+type WithTotals<Q, Row, Totals, Period extends ResultPeriod> = Q extends {
+	totals: false
+}
+	? ResultWithoutTotals<Row, Period>
+	: QueryResult<Row, Totals, Period>
+
+/** `previous` is there whenever the query literally asks for it. */
+type WithPrevious<Q, R extends { previous?: unknown }> = Q extends {
+	compareToPrevious: true
+}
+	? R & { previous: NonNullable<R['previous']> }
+	: R
 
 /** The typed result of query `Q` against the datasets `DS`. */
 export type ResultOf<DS, Q> =
 	DS extends Dataset<infer K, infer M, infer Dm, string, infer P>
 		? Q extends { dataset: K; measures: readonly (infer Mk extends string)[] }
-			? QueryResult<
-					ResultRow<M, Dm, Mk, GroupKeys<Q>>,
-					ResultTotals<M, Mk>,
-					PeriodShape<QueryPeriod<Q, P>>
+			? WithPrevious<
+					Q,
+					WithTotals<
+						Q,
+						ResultRow<M, Dm, Mk, GroupKeys<Q>>,
+						ResultTotals<M, Mk>,
+						PeriodShape<QueryPeriod<Q, P>>
+					>
 				>
 			: never
 		: never
@@ -161,7 +223,7 @@ export type ResultOf<DS, Q> =
 
 const isoDate = z.iso.date().describe('A date, YYYY-MM-DD.')
 
-const periodSchema = z.union([
+export const periodSchema = z.union([
 	z.object({
 		last: z.object({
 			days: z
@@ -266,8 +328,20 @@ function filterSchema(key: string, dim: AnyDimension) {
 	}
 }
 
+/** How a schema is built: `querySchema()` for callers, `parse` for what `query` accepts. */
+export type QuerySchemaOptions = {
+	/** The highest `limit`; `MAX_LIMIT` unless `createAnalytics({ maxLimit })` raises it. */
+	maxLimit?: number | undefined
+	/** Adds the fields only app code may set (`totals`), which a model's schema leaves out. */
+	parse?: boolean | undefined
+}
+
 /** The input schema branch for one dataset. */
-export function datasetQuerySchema(dataset: AnyDataset) {
+export function datasetQuerySchema(
+	dataset: AnyDataset,
+	options: QuerySchemaOptions = {}
+) {
+	const maxLimit = options.maxLimit ?? MAX_LIMIT
 	const measures: [string, AnyMeasure][] = Object.entries(dataset.measures)
 	const dimensions: [string, AnyDimension][] = Object.entries(
 		dataset.dimensions
@@ -352,9 +426,10 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 				.number()
 				.int()
 				.min(1)
-				.max(MAX_LIMIT)
+				.max(maxLimit)
 				.optional()
-				.describe(`Maximum number of groups. Defaults to ${DEFAULT_LIMIT}.`)
+				.describe(`Maximum number of groups. Defaults to ${DEFAULT_LIMIT}.`),
+			...(options.parse && { totals: z.boolean().optional() })
 		})
 		.superRefine((query, context) => {
 			// Sorting by something the query does not return would be silently ignored.
@@ -391,8 +466,13 @@ export function datasetQuerySchema(dataset: AnyDataset) {
 }
 
 /** A discriminated union on `dataset`, one branch per dataset. */
-export function buildQuerySchema(datasets: readonly AnyDataset[]) {
-	const [first, ...rest] = datasets.map(datasetQuerySchema)
+export function buildQuerySchema(
+	datasets: readonly AnyDataset[],
+	options: QuerySchemaOptions = {}
+) {
+	const [first, ...rest] = datasets.map((dataset) =>
+		datasetQuerySchema(dataset, options)
+	)
 	if (!first) throw new Error('querySchema needs at least one dataset')
 
 	return z.discriminatedUnion('dataset', [first, ...rest])
@@ -403,7 +483,7 @@ const rangeOutput = z.object({
 	to: z.string(),
 	timezone: z.string()
 })
-const periodOutput = z.union([
+export const periodOutput = z.union([
 	rangeOutput,
 	z.object({ all: z.literal(true), timezone: z.string() })
 ])
@@ -413,7 +493,40 @@ const dimensionValue = z.object({
 	label: z.string()
 })
 
-/** The envelope every result shares; only the row and totals shapes differ per dataset. */
+const fieldsOutput = z.object({
+	groupBy: z.array(
+		z.object({
+			key: z.string(),
+			label: z.string(),
+			kind: z.enum([
+				'enum',
+				'computed',
+				'relation',
+				'manyToMany',
+				'number',
+				'timePart',
+				'timeBucket'
+			]),
+			unit: z.enum(['day', 'week', 'month']).optional(),
+			values: z
+				.array(z.object({ key: z.string(), label: z.string() }))
+				.optional()
+		})
+	),
+	measures: z.array(
+		z.object({
+			key: z.string(),
+			label: z.string(),
+			valueType: z.enum(['count', 'number', 'ratio'])
+		})
+	)
+})
+
+/**
+ * The envelope every result shares; only the row and totals shapes differ per dataset.
+ * `totals` and `fields` are optional, for `totals: false` and for results stored before
+ * `fields` existed.
+ */
 function resultSchemaOf<Row extends z.ZodType, Totals extends z.ZodType>(
 	row: Row,
 	totals: Totals
@@ -421,12 +534,17 @@ function resultSchemaOf<Row extends z.ZodType, Totals extends z.ZodType>(
 	return z.object({
 		period: periodOutput,
 		rows: z.array(row),
-		totals,
+		totals: totals.optional(),
 		previous: z
-			.object({ period: rangeOutput, rows: z.array(row), totals })
+			.object({
+				period: rangeOutput,
+				rows: z.array(row),
+				totals: totals.optional()
+			})
 			.optional(),
 		notes: z.array(z.string()),
-		truncated: z.boolean()
+		truncated: z.boolean(),
+		fields: fieldsOutput.optional()
 	})
 }
 

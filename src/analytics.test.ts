@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { z } from 'zod'
 import {
 	type AnalyticsCache,
 	type AnalyticsQueryEvent,
@@ -575,4 +576,350 @@ test('listDatasets says what values each measure gives', async () => {
 		paidShare: 'ratio',
 		refundRate: 'ratio'
 	})
+})
+
+describe('query options', () => {
+	/** Records every statement; answers grouped statements with `rows`, the rest with totals. */
+	function recording(
+		options: {
+			rows?: Row[]
+			concurrency?: number
+			maxLimit?: number
+			cache?: AnalyticsCache<Ctx>
+			execute?: (signal: AbortSignal | undefined) => Promise<void>
+		} = {}
+	) {
+		const statements: string[] = []
+		const signals: (AbortSignal | undefined)[] = []
+		const analytics = createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: {
+					dialect: postgresDialect(),
+					execute: async ({ text }, execution) => {
+						statements.push(text)
+						signals.push(execution?.signal)
+						await options.execute?.(execution?.signal)
+						return text.includes('"g_')
+							? (options.rows ?? [])
+							: [{ m_orders: 3 }]
+					}
+				}
+			},
+			tenant: (ctx: Ctx) => ctx.tenantId,
+			...(options.concurrency && { concurrency: options.concurrency }),
+			...(options.maxLimit && { maxLimit: options.maxLimit }),
+			...(options.cache && { cache: options.cache })
+		})
+		return { analytics, statements, signals }
+	}
+
+	const byStatus = {
+		dataset: 'orders',
+		measures: ['orders'],
+		groupBy: ['status']
+	} as const
+
+	test('totals: false skips the totals statement and leaves totals out', async () => {
+		const { analytics, statements } = recording({
+			rows: [{ g_status: 'PAID', m_orders: 2 }]
+		})
+
+		const result = await analytics.query(
+			{ ...byStatus, totals: false, compareToPrevious: true },
+			ctx
+		)
+
+		expect(statements).toHaveLength(2)
+		expect('totals' in result).toBe(false)
+		expect('totals' in result.previous).toBe(false)
+		expect(result.rows[0]?.orders).toBe(2)
+		// @ts-expect-error a result without totals says so in its type
+		void result.totals
+	})
+
+	test('totals stay the default, and models are not offered the option', async () => {
+		const { analytics, statements } = recording()
+
+		const result = await analytics.query(byStatus, ctx)
+
+		expect(statements).toHaveLength(2)
+		expect(result.totals.orders).toBe(3)
+		expect(
+			JSON.stringify(z.toJSONSchema(analytics.querySchema()))
+		).not.toContain('"totals"')
+	})
+
+	test('maxLimit raises the limit for app code; the schema a model gets keeps 100', async () => {
+		const { analytics, statements } = recording({ maxLimit: 500 })
+
+		await analytics.query({ ...byStatus, limit: 300 }, ctx)
+
+		expect(statements[0]).toContain('LIMIT 301')
+		expect(
+			analytics.querySchema().safeParse({ ...byStatus, limit: 300 }).success
+		).toBe(false)
+		await expect(
+			recording().analytics.query({ ...byStatus, limit: 300 }, ctx)
+		).rejects.toMatchObject({ code: 'invalid_query' })
+	})
+
+	test('a result describes its grouped dimensions and measures', async () => {
+		const { analytics } = recording()
+
+		const result = await analytics.query(
+			{
+				dataset: 'orders',
+				measures: ['orders', 'paidShare'],
+				groupBy: ['day', 'size']
+			},
+			ctx
+		)
+
+		expect(result.fields).toEqual({
+			groupBy: [
+				{ key: 'day', label: 'Day', kind: 'timeBucket', unit: 'day' },
+				{
+					key: 'size',
+					label: 'Size',
+					kind: 'computed',
+					values: [
+						{ key: 'large', label: 'Large' },
+						{ key: 'medium', label: 'Medium' },
+						{ key: 'small', label: 'Small' }
+					]
+				}
+			],
+			measures: [
+				{ key: 'orders', label: 'Orders', valueType: 'count' },
+				{ key: 'paidShare', label: 'Paid', valueType: 'ratio' }
+			]
+		})
+		expect(AnalyticsResultSchema.parse(result).fields).toEqual(result.fields)
+	})
+
+	test('concurrency caps the statements running at once', async () => {
+		let running = 0
+		let most = 0
+		const { analytics, statements } = recording({
+			concurrency: 2,
+			execute: async () => {
+				most = Math.max(most, ++running)
+				await new Promise((resolve) => setTimeout(resolve, 5))
+				running--
+			}
+		})
+
+		await Promise.all(
+			[1, 2, 3].map((days) =>
+				analytics.query(
+					{ ...byStatus, period: { last: { days } }, compareToPrevious: true },
+					ctx
+				)
+			)
+		)
+
+		expect(statements).toHaveLength(12)
+		expect(most).toBe(2)
+	})
+
+	test('an aborted query rejects with the reason and reaches the source', async () => {
+		const controller = new AbortController()
+		const { analytics, signals } = recording({
+			execute: async (signal) => {
+				controller.abort(new Error('gone'))
+				signal?.throwIfAborted()
+			}
+		})
+
+		await expect(
+			analytics.query(byStatus, ctx, { signal: controller.signal })
+		).rejects.toThrow('gone')
+		expect(signals[0]).toBe(controller.signal)
+		await expect(
+			analytics.query(byStatus, ctx, { signal: controller.signal })
+		).rejects.toThrow('gone')
+	})
+
+	test('a waiting statement leaves the queue when its query aborts', async () => {
+		let release = () => {}
+		const { analytics, statements } = recording({
+			concurrency: 1,
+			execute: () => new Promise((resolve) => (release = resolve))
+		})
+		const first = analytics.query(
+			{ dataset: 'orders', measures: ['orders'] },
+			ctx
+		)
+		const controller = new AbortController()
+		const second = analytics.query(
+			{ dataset: 'orders', measures: ['revenue'] },
+			ctx,
+			{ signal: controller.signal }
+		)
+		await Bun.sleep(1)
+		controller.abort(new Error('gone'))
+
+		await expect(second).rejects.toThrow('gone')
+		release()
+		await first
+		expect(statements).toHaveLength(1)
+	})
+
+	test('with a cache, identical queries in flight share one run', async () => {
+		const store = new Map<string, unknown>()
+		const cache: AnalyticsCache<Ctx> = {
+			get: (key) => store.get(key),
+			set: (key, result) => store.set(key, result)
+		}
+		const { analytics, statements } = recording({
+			cache,
+			execute: () => Bun.sleep(5)
+		})
+
+		const [a, b] = await Promise.all([
+			analytics.query(byStatus, ctx),
+			analytics.query(byStatus, ctx)
+		])
+
+		expect(a).toEqual(b)
+		expect(statements).toHaveLength(2)
+	})
+
+	test('a shared run goes on while one of its callers still waits', async () => {
+		const { analytics, statements } = recording({
+			cache: { get: () => null, set: () => {} },
+			execute: () => Bun.sleep(5)
+		})
+		const controller = new AbortController()
+
+		const gone = analytics.query(byStatus, ctx, { signal: controller.signal })
+		const kept = analytics.query(byStatus, ctx)
+		await Bun.sleep(1)
+		controller.abort(new Error('gone'))
+
+		await expect(gone).rejects.toThrow('gone')
+		expect((await kept).totals.orders).toBe(3)
+		expect(statements).toHaveLength(2)
+	})
+
+	test('a changed definition is a different cache entry', async () => {
+		const keys: string[] = []
+		const cache: AnalyticsCache<Ctx> = {
+			get: () => null,
+			set: (key) => keys.push(key)
+		}
+		const relabeled = {
+			...orders,
+			measures: {
+				...orders.measures,
+				orders: { ...orders.measures.orders, label: 'Placed orders' }
+			}
+		}
+		for (const dataset of [orders, relabeled]) {
+			await createAnalytics({
+				datasets: [dataset],
+				sources: {
+					main: { dialect: postgresDialect(), execute: async () => [] }
+				},
+				tenant: (ctx: Ctx) => ctx.tenantId,
+				cache
+			}).query({ dataset: 'orders', measures: ['orders'] }, ctx)
+		}
+
+		expect(keys).toHaveLength(2)
+		expect(keys[0]).not.toBe(keys[1])
+	})
+
+	test('onQuery and the cache hear the metric a query runs for', async () => {
+		const events: AnalyticsQueryEvent[] = []
+		const entries: unknown[] = []
+		await createAnalytics({
+			datasets: [orders],
+			sources: {
+				main: { dialect: postgresDialect(), execute: async () => [] }
+			},
+			tenant: (ctx: Ctx) => ctx.tenantId,
+			onQuery: (event) => events.push(event),
+			cache: { get: () => null, set: (_, __, entry) => entries.push(entry) }
+		}).query({ dataset: 'orders', measures: ['orders'] }, ctx, {
+			metric: 'orders.count'
+		})
+
+		expect(events[0]?.metric).toBe('orders.count')
+		expect(entries).toEqual([
+			{ dataset: 'orders', ctx, metric: 'orders.count' }
+		])
+	})
+})
+
+describe('period and scope', () => {
+	const analytics = createAnalytics({
+		datasets: [orders],
+		sources: { main: { dialect: postgresDialect(), execute: async () => [] } },
+		tenant: (ctx: { tenantId?: string }) => ctx.tenantId,
+		timezone: () => 'Europe/Copenhagen',
+		now: () => new Date('2026-11-10T23:30:00Z')
+	})
+
+	test('period resolves local days in the timezone of ctx', async () => {
+		expect(await analytics.period({ last: { days: 7 } }, {})).toMatchObject({
+			from: '2026-11-05',
+			to: '2026-11-11',
+			timezone: 'Europe/Copenhagen',
+			days: 7
+		})
+		expect(await analytics.period({ all: true }, {})).toBeNull()
+		await expect(
+			analytics.period({ from: '2026-11-02', to: '2026-11-01' }, {})
+		).rejects.toMatchObject({ code: 'invalid_period' })
+	})
+
+	test('scope is the tenant every query gets, and refuses none', () => {
+		expect(analytics.scope({ tenantId: 't1' })).toBe('t1')
+		expect(() => analytics.scope({})).toThrow('without a tenant')
+	})
+})
+
+test('listDatasets gives a resolved measure its own value type', async () => {
+	const order = table<Order>('orders')
+	const resolved = defineDataset({
+		key: 'resolvedOrders',
+		label: 'Orders',
+		description: 'One row per order.',
+		from: order,
+		tenantColumn: order.col('tenantId'),
+		time: { created: { column: order.col('createdAt'), label: 'Created' } },
+		measures: {
+			orders: measure.count({ label: 'Orders' }),
+			forecast: measure.resolved({
+				label: 'Forecast',
+				result: 'count',
+				uses: ['orders']
+			}),
+			perDay: measure.resolved({
+				label: 'Per day',
+				result: 'number',
+				uses: ['orders']
+			})
+		},
+		dimensions: {}
+	})
+	const [entry] = await createAnalytics({
+		datasets: [resolved],
+		sources: { main: { dialect: postgresDialect(), execute: async () => [] } },
+		tenant: () => 't1',
+		resolvers: {
+			resolvedOrders: {
+				forecast: () => ({ rows: [], totals: null }),
+				perDay: () => ({ rows: [], totals: null })
+			}
+		}
+	}).listDatasets({})
+
+	expect(entry?.measures.map((m) => m.valueType)).toEqual([
+		'count',
+		'count',
+		'number'
+	])
 })

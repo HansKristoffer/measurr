@@ -159,8 +159,8 @@ With them:
   the field.
 
 `AnalyticsResultSchema` is any dataset's result without its keys: rows of `{ key, label }`
-per grouped dimension and a number or null per measure, with totals, `previous?`, `notes` and
-`truncated`. `analytics.resultSchema(key)` is the same envelope with the dataset's fields, so a
+per grouped dimension and a number or null per measure, with totals, `previous?`, `notes`,
+`truncated` and `fields`. `analytics.resultSchema(key)` is the same envelope with the dataset's fields, so a
 result that passes one passes the other. Use it for a tool's output contract.
 
 `analyticsToolGuidance` is a few markdown bullets for a model's instructions: use the tool for
@@ -176,14 +176,47 @@ ${analyticsToolGuidance}`
 ```
 
 `onQuery(event, ctx)` hears every `query` once it succeeds or fails:
-`{ dataset, durationMs, rows, outcome: 'success' | 'error', cache?, error? }`. `dataset` is null
-when the input named no known dataset, so free text from a model never becomes a metric label.
+`{ dataset, metric?, durationMs, rows, outcome: 'success' | 'error', cache?, error? }`. `dataset`
+is null when the input named no known dataset, so free text from a model never becomes a metric
+label. `metric` is the metric the registry ran the query for.
 `cache` is `'hit'` or `'miss'` when a cache is configured. What the hook throws or rejects with is
 swallowed; it cannot fail a query.
 
 Each measure in `listDatasets` has a `valueType`: `count` (a whole number, never null),
 `ratio` (0-1, from `share` and `ratio`) or `number` (sums, averages, medians), so a UI knows
-to format a share as a percentage.
+to format a share as a percentage. A resolved measure has the `result` it declares.
+
+## Query options
+
+```ts
+const result = await analytics.query(
+	{ dataset: 'orders', measures: ['orders'], groupBy: ['day', 'status'], limit: 400, totals: false },
+	ctx,
+	{ signal: request.signal }
+)
+result.fields
+// { groupBy: [{ key: 'day', label: 'Day', kind: 'timeBucket', unit: 'day' },
+//             { key: 'status', label: 'Status', kind: 'enum', values: [{ key: 'OPEN', label: 'Open' }, ...] }],
+//   measures: [{ key: 'orders', label: 'Orders', valueType: 'count' }] }
+```
+
+- `fields` describes every result: its grouped dimensions (kind, a time bucket's `unit`, a
+  closed dimension's `values`) and its measures (label, `valueType`), so a chart drawn from a
+  model's tool output needs no guessing.
+- `totals: false` skips a grouped query's totals statement, and the result has no `totals`
+  (its type says so). The presenters do not need them. It is for app code: `querySchema` does
+  not offer it to a model, which would then add up overlapping rows.
+- `createAnalytics({ maxLimit })` raises the highest `limit` `query` accepts, for app code such
+  as a long time series. The schema `querySchema` builds keeps 100.
+- `createAnalytics({ concurrency })` caps how many statements run at once on each source, so a
+  large dashboard cannot take every pooled connection.
+- `signal` aborts a query: it rejects with the signal's reason, statements waiting for a slot
+  never start, and `execute` gets `{ signal }` as its second argument to cancel a running one.
+- `analytics.period(input, ctx)` resolves a period the way `query` does (its local days, start
+  and end instants and length, or null for all time), and `analytics.scope(ctx)` returns the
+  tenant scope `query` would use, refusing a missing one. Use them when code reads the same rows
+  another way (Prisma, another database).
+
 
 ## Caching
 
@@ -209,9 +242,17 @@ createAnalytics({
 ```
 
 A stored value that is not a result of its dataset counts as a miss, and a cache that throws or
-rejects is a miss or a skipped write, never a failed query. A changed measure keeps its key, so
-prefix keys with a build id (as above) if old numbers must not outlive a deploy. A dataset that
-uses `minutesAgo` is as stale as the time to live.
+rejects is a miss or a skipped write, never a failed query. The key also hashes the dataset's
+definition (its compiled SQL, labels and values), so a deploy that changes a measure misses the
+cache. Resolver code is not part of it: prefix keys with a build id (as above) if a changed
+resolver's old numbers must not outlive a deploy. A dataset that uses `minutesAgo` is as stale as
+the time to live.
+
+With a cache, identical queries that run at the same time (two metrics of one dashboard, two
+people opening it) share one run. The entry names the `metric` a registry ran the query for, so
+`set` can pick a time to live per metric. The key holds the tenant scope and nothing else from
+`ctx`, so a cached or shared result must not depend on anything else in it: a resolver that
+reads the user from `ctx` belongs in an uncached instance.
 
 ## Chart shapes
 
@@ -234,20 +275,26 @@ toLeaderboard(result, { by: 'region', measure: 'revenue' }) // ranked rows with 
 ```
 
 - `toTimeseries` gives every bucket of the period a point; buckets without rows get `fill` (0 by
-  default, pass `null` for averages). An all-time result has only the buckets it found. The
-  previous period's points are on its own buckets; compare them by position.
-- A grouped query returns at most `limit` rows (20 by default, 100 at most), and the shape keeps
-  `truncated`. Set `limit: 100` for a series; 30 days split into three series fit, 90 days into
-  eleven do not.
+  default, pass `null` for averages). An ungrouped series exists even for a period without rows.
+  An all-time result has only the buckets it found. The previous period's points are on its own
+  buckets; compare them by position.
+- `seriesKeys` (and `segmentKeys` for distributions) lists keys to draw even when no row has
+  them, a zero lane per channel, first and in that order. `'all'` takes a closed dimension's
+  values from the result's `fields`.
+- A grouped query returns at most `limit` rows (20 by default, 100 at most, or `maxLimit`), and
+  the shape keeps `truncated`. Set a `limit` that covers every bucket and series: 30 days split
+  into three series fit in 100, 90 days into eleven do not.
 - `toDistribution`'s `total` is the measure over every row, so many-to-many shares can add up to
-  more than 1. `toPivot` sorts numeric keys (weekdays, hours).
+  more than 1; it is null for a result without totals. `toPivot` sorts numeric keys (weekdays,
+  hours).
 
 ### Presentation
 
-`presentKpi`, `presentTimeseries`, `presentDistribution` and `presentLeaderboard` turn a result
-into the wire outputs a dashboard draws (`KpiOutput`, `TimeSeriesOutput`, `DistributionOutput`,
-`LeaderboardOutput`; `TableOutput` and `PivotOutput` for outputs you build yourself). A missing
-value is 0, keys are strings, and the caller picks labels, units and chart types:
+`presentKpi`, `presentTimeseries`, `presentDistribution`, `presentLeaderboard`, `presentPivot`
+and `presentTable` turn a result into the wire outputs a dashboard draws (`KpiOutput`,
+`TimeSeriesOutput`, `DistributionOutput`, `LeaderboardOutput`, `PivotOutput`, `TableOutput`). A
+missing value is 0, keys are strings, and the caller picks labels, units and chart types. An
+output whose query was cut at its `limit` has `truncated: true`:
 
 ```ts
 presentKpi(result, 'paidShare', { label: 'Paid', percent: true })
@@ -255,32 +302,44 @@ presentKpi(result, 'paidShare', { label: 'Paid', percent: true })
 
 presentTimeseries(result, {
 	bucket: 'day', measure: 'orders', series: 'status',
+	seriesKeys: 'all', // a lane for every status, rows or not
 	keys: { PAID: 'paid' }, // wire keys, by String(key); 'null' names the empty group
 	labels: { paid: 'Settled' }, // labels by wire key
 	chartType: 'line'
 })
-// points are { ts: Date, value }: ts is the bucket's local start date as UTC midnight
+// points are { ts: Date, bucket: '2026-10-01', value }: ts is the bucket's local start date as
+// UTC midnight, so format `bucket`, not `ts` in the viewer's timezone
 
 presentDistribution(result, { by: 'tag', measure: 'orders', chartType: 'donut', order: ['t2'] })
 // total is what the segments add up to, percent is 0-100; keys order omits go last
 
 presentLeaderboard(result, { by: 'region', measure: 'orders', meta: (values) => ({ revenue: values.revenue }) })
+
+presentPivot(result, { rows: 'weekday', columns: 'hour', measure: 'orders', totals: true })
+// rows and columns by label; totals are sums of the cells, so leave them off for an average
+
+presentTable(result, { columns: ['region', 'orders'], labels: { orders: 'Count' } })
+// a column per grouped dimension (its label; a bucket's date) and per measure, from `fields`
 ```
 
 `isKpi`, `isTimeSeries`, `isDistribution`, `isTable`, `isLeaderboard` and `isPivot` narrow a
-`MetricOutput`. The module is pure, so a browser bundle can import the types and guards.
+`MetricOutput`. `OUTPUT_KINDS` lists every kind, and `pickRenderer(map, output, fallback)` picks
+a renderer from a map that must name every kind (a new kind fails typecheck) and falls back for a
+kind the client does not know yet. The module is pure, so a browser bundle can import the types
+and guards.
 
 ## Dashboard metrics
 
 `measurr/metrics` names the numbers a dashboard shows: one query and the output it is drawn
-in. The registry runs a batch for a caller and streams one chunk per metric.
+in, or a `resolve` function for a number a dataset cannot give. The registry runs a batch for a
+caller and streams one chunk per metric.
 
 ```ts
 import { createMetricRegistry, metricDefiner } from 'measurr/metrics'
 import { presentKpi, presentTimeseries } from 'measurr/shapes'
 
 // Types only, so metric modules need not import the analytics instance.
-export const defineMetric = metricDefiner<(typeof datasets)[number], Role>()
+export const defineMetric = metricDefiner<(typeof datasets)[number], Role, {}, Ctx>()
 
 const orderTrend = defineMetric({
 	key: 'orders.trend',
@@ -288,48 +347,123 @@ const orderTrend = defineMetric({
 	description: 'Orders over time',
 	allowedRoles: ['owner', 'member'],
 	supportsTimeRange: true, // false for a snapshot: all time, no previous period
-	filterSchema: z.object({ status: z.enum(['OPEN', 'PAID']).optional() }),
+	filterSchema: z.object({ status: z.enum(['OPEN', 'PAID']).optional() }), // optional
 	query: ({ bucket, filters }) => ({
 		dataset: 'orders',
 		measures: ['orders'],
 		groupBy: [bucket],
 		filters: filters.status ? [{ dimension: 'status', op: 'in', values: [filters.status] }] : [],
-		limit: 100
+		limit: 100,
+		totals: false // no presenter reads them; saves a statement per period
 	}),
 	shape: (result, { bucket }) =>
 		presentTimeseries(result, { bucket, measure: 'orders', chartType: 'bar' })
 })
 
+const myOpenItems = defineMetric({
+	key: 'workItems.mine',
+	kind: 'kpi',
+	description: 'Open items assigned to me',
+	supportsTimeRange: false,
+	// `ctx` is the caller; the tenant scope applies anyway.
+	query: ({ ctx }) => ({
+		dataset: 'workItems',
+		measures: ['items'],
+		filters: [{ dimension: 'assignee', op: 'in', values: [ctx.userId] }]
+	}),
+	shape: (result) => presentKpi(result, 'items')
+})
+
+// Prisma, another database: the registry still decides the period, the previous period and
+// the tenant scope. Filter every read by `tenant`.
+const seatsUsed = defineMetric({
+	key: 'billing.seats',
+	kind: 'kpi',
+	description: 'Seats in use',
+	supportsTimeRange: true,
+	resolve: async ({ period, tenant, signal }) => ({
+		kind: 'kpi',
+		value: await countSeats({ organizationIds: tenant, from: period?.start, to: period?.end, signal })
+	})
+})
+
 export const metrics = createMetricRegistry({
 	analytics,
-	metrics: [orderTrend, orderCount] as const,
-	canRun: (metric, ctx) => ctx.isSuperAdmin || (metric.allowedRoles ?? []).includes(ctx.role),
-	onShapeError: (error, metric) => logger.error('metric.shape_failed', { key: metric.key, error })
+	metrics: [orderTrend, myOpenItems, seatsUsed] as const,
+	canRun: (metric, ctx) => (metric.allowedRoles ?? ALL_ROLES).includes(ctx.role),
+	onError: (error, { key, code }) => logger.error('metric.failed', { key, code, error })
 })
 
 const input = metrics.requestSchema.extend({ refresh: z.boolean().default(false) }).parse(body)
-for await (const chunk of metrics.run(input, ctx)) send(chunk)
-// { key, requestKey, result: { current, previous?, supportsTimeRange }, done }
-// or { key, requestKey, error, done }
+for await (const chunk of metrics.run(input, ctx, { signal: request.signal })) send(chunk)
+// { key, requestKey, result: { current, previous?, supportsTimeRange, period }, done }
+// or { key, requestKey, error, code, done }
+
+const { results, errors } = await metrics.collect(input, ctx) // by request key, typed per key
+const seats = await metrics.one('billing.seats', { period: { last: { days: 7 } } }, ctx)
 ```
 
-- `query` returns the query without `period` or `compareToPrevious`. The registry counts the
-  local days `from` and `to` (instants) fall on in `analytics.timezone(ctx)`, all time without
-  them, and always all time for a snapshot. `compareToPrevious` adds the previous period, whose
-  series points are put on the current buckets so a chart overlays them.
-- `granularity` (hour to year, inferred from the range when omitted: day up to 31 days, week up
-  to 90, else month) picks `run.bucket`: `day`, `week` or `month`. Name time-bucket dimensions
-  after them so `groupBy: [bucket]` works.
-- A metric that `canRun` refuses (`'Access denied'`), whose filters do not parse with its
-  `filterSchema` (`'Invalid filters: ...'`), whose query fails (the engine's message) or whose
-  `shape` throws (`'The metric could not be drawn'`) fails alone. `done` marks the last chunk.
-- `metricDefiner<Datasets, Role, Extra>()` takes the app's own definition fields as `Extra`
-  (catalog metadata, UI hints for filters); the registry carries them to `canRun` and
+- A request names its period like a query, `period: { last: { days: 7 } }` or any other
+  `PeriodInput`, counted in `analytics.timezone(ctx)`, so a client that does not know the
+  tenant's timezone can still ask for "the last 7 days". Or it sends `from` and `to` as
+  instants, counted as the local days they fall on; `from` alone counts up to today. `to`
+  without `from`, or `period` with either, rejects with `invalid_period`. Without any, a metric
+  counts all time; a snapshot always does.
+- Every result carries the `period` it counted: `{ from, to, timezone }` or `{ all: true,
+  timezone }`, so a chart can mark today without a second request.
+- `query` returns the query without `period` or `compareToPrevious`. `compareToPrevious` adds
+  the previous period, whose series points are put on the current buckets so a chart overlays
+  them. With week or month buckets the two periods can differ by a bucket: points pair from the
+  end, and a previous point before the current period's first bucket is dropped.
+- `granularity` (hour to year, inferred from the period's days when omitted: day up to 31
+  days, week up to 90, else month) picks `run.bucket`: `day`, `week` or `month`; `hour` draws
+  days and `quarter` and `year` draw months, and the output's `granularity` says which. Name
+  time-bucket dimensions after them so `groupBy: [bucket]` works.
+- `query` and `shape` get `run.ctx`, and `metricDefiner`'s fourth parameter types it. A filter
+  on the caller's own id is part of the query, so the cache key already separates users.
+- A `resolve` metric gets the filters, bucket and granularity, the `period` (local days with
+  `start` and `end` instants, or null for all time), the `tenant` from `analytics.scope(ctx)`
+  (`allTenants` included), `ctx` and a `signal`. It is called once for the period and, with
+  `compareToPrevious`, once for the previous one. Nothing scopes its reads but the code: filter
+  every read by `tenant`.
+- A metric fails alone, with a `code` next to its message: `unknown_metric`, `forbidden`
+  (`canRun` refused it), `invalid_filters`, `truncated`, `shape_failed`, `internal` (a driver
+  error or a throwing `resolve`; the message does not say what), or the engine's codes such as
+  `missing_tenant`. `onError(error, { key, requestKey, code, metric }, ctx)` hears every
+  failure with what was thrown; `onShapeError` still works and is deprecated.
+- A time series whose query was cut at its `limit` fails with `truncated` instead of drawing
+  zeros for the newest buckets. Raise its `limit` (and `maxLimit`) or ask for a shorter period.
+- `filterSchema` is optional; without it a metric takes no filters.
+- `metricDefiner<Datasets, Role, Extra, Ctx>()` takes the app's own definition fields as
+  `Extra` (catalog metadata, UI hints for filters); the registry carries them to `canRun` and
   `available` without reading them.
-- Keys and outputs stay literal: a chunk narrows to its metric by `key`, and
-  `MetricOutputOf<typeof metrics, 'orders.trend'>`, `MetricFiltersOf`, `MetricKeysOfKind` and
-  `registry.get(key)` are typed per metric. `registry.available(ctx)` lists what `canRun`
-  allows, for a catalog.
+- Keys and outputs stay literal: a chunk narrows to its metric by `key`, `collect`'s results and
+  `one` are typed per key, and `MetricOutputOf<typeof metrics, 'orders.trend'>`,
+  `MetricFiltersOf`, `MetricKeysOfKind` and `registry.get(key)` are typed per metric.
+  `registry.available(ctx)` lists what `canRun` allows, for a catalog.
+- A consumer that stops reading `run` (a closed stream) aborts the statements still running;
+  `signal` does the same from outside.
+- `metricOutputSchemas` (one per kind), `MetricOutputSchema` and `MetricResultSchema` are Zod
+  schemas for an endpoint's output contract or a cached output; `ts` is coerced, so JSON parses
+  back.
+
+**Access belongs to `ctx`.** `canRun` decides which metrics a caller may run, and `tenant(ctx)`
+decides what any of them can count. Keep both in one discriminated context and never add a
+bypass flag:
+
+```ts
+type Ctx =
+	| { kind: 'member'; organizationId: OrganizationId; role: Role }
+	| { kind: 'staff'; organizationIds: readonly OrganizationId[] | typeof allTenants; role: 'staff' }
+
+canRun: (metric, ctx) => (metric.allowedRoles ?? ALL_ROLES).includes(ctx.role),
+tenant: (ctx) => (ctx.kind === 'member' ? ctx.organizationId : ctx.organizationIds)
+```
+
+A job that reports for one organization (a monthly PDF, an email) is a caller too: build a
+`ctx` scoped to that organization, the same one a member of it would get, rather than a staff
+context with every tenant. A metric that forgets a scope then counts too little, never another
+customer's rows.
 
 ## Serving queries
 
@@ -340,7 +474,9 @@ for await (const chunk of metrics.run(input, ctx)) send(chunk)
   others; an error other than `AnalyticsError` is reported as `{ code: 'internal' }` without
   its message.
 - `streamBatch(analytics, queries, ctx)` yields `{ key, result }` or `{ key, error }` as each
-  query finishes, for a streaming endpoint.
+  query finishes, for a streaming endpoint. A consumer that stops reading aborts the statements
+  still running.
+- Both take `{ signal }` as a fourth argument; aborting it rejects with the signal's reason.
 - `toHttpError(error)` maps an `AnalyticsError` to `{ status, code, message, data? }`:
   `forbidden` is 403 `FORBIDDEN`, `missing_tenant` 401 `UNAUTHORIZED`, the rest 400
   `BAD_REQUEST` with the code and details. The codes are the names oRPC and tRPC use:
@@ -472,8 +608,8 @@ before any statement runs; a narrower scope is never ignored. `listDatasets(ctx)
 | Dataset | One fact table: tenant column (or `null`), optional scope, time fields, default period, measures, dimensions, source. |
 | Measure | `count`, `countWhere`, `countDistinct`, `sum`, `avg`, `median`, `share` (one condition over another), `ratio` (one measure over another, after aggregation) or `resolved` (computed by the app after the query runs). Optionally restricted with `access`. |
 | Dimension | `enum`, `computed` (closed value sets), `relation` (to-one), `manyToMany`, `number`, `timeBucket` (day, ISO week, month), `timePart` (ISO weekday, hour). Optionally restricted with `access`. |
-| Query | `dataset`, 1-4 `measures`, 0-2 `groupBy`, `filters`, `period`, `time`, `compareToPrevious`, `sort` (by an asked measure or grouped dimension), `limit` (1-100, default 20). |
-| Result | `{ period, rows, totals, previous?, notes, truncated }`; `period` is `{ from, to, timezone }` or `{ all: true, timezone }`. |
+| Query | `dataset`, 1-4 `measures`, 0-2 `groupBy`, `filters`, `period`, `time`, `compareToPrevious`, `sort` (by an asked measure or grouped dimension), `limit` (1-100 or `maxLimit`, default 20), and for app code `totals`. |
+| Result | `{ period, rows, totals, previous?, notes, truncated, fields }`; `period` is `{ from, to, timezone }` or `{ all: true, timezone }`. `previous` is typed as present when the query says `compareToPrevious: true`. |
 
 **Operators per dimension kind.** Closed and open dimensions take `in`, `notIn`, `isEmpty`
 and `isNotEmpty`; numeric and time dimensions take `between`, `isEmpty` and `isNotEmpty`. The
@@ -484,6 +620,18 @@ unlike SQL's `NOT IN`.
 keys or names (case-insensitive); the engine resolves them before planning. An unknown value
 fails with `AnalyticsError('unknown_value')` listing the valid values, so a model can retry
 once.
+
+The lookup reads the fact table of the tenant by default, every row it ever had. Give the
+dimension a `lookup` to read the names from their own table instead; the key and the name must
+be columns of it, and `tenantColumn` scopes it (null for a table every tenant shares). The
+valid values are then every entry of that table, not only those with rows.
+
+```ts
+team: dimension.relation({
+	label: 'Team', key: team.col('id'), name: team.col('name'),
+	lookup: { tenantColumn: team.col('organizationId') }
+})
+```
 
 **Errors carry typed details.** `isAnalyticsError(error, code?)` narrows by code:
 `unknown_value` details are `{ dimension, unknown, valid }` and `invalid_query` details are the
@@ -521,7 +669,15 @@ every unit. The generated schema states each dataset's default, so a model knows
 
 **Totals are a separate, ungrouped statement**, so a many-to-many grouping (an order with
 two tags appears in two rows) never inflates them. Filters on many-to-many dimensions compile
-to `EXISTS`, so they never multiply rows either.
+to `EXISTS`, so they never multiply rows either. A grouped query is therefore two statements
+per period, four with `compareToPrevious`, plus one per open-dimension label lookup; `totals:
+false` drops the totals statements.
+
+**Daily rollups cannot see part of a day.** A dataset over a table with one row per day (usage
+per unit per day) counts whole local days. It cannot start a unit at the hour it joined or end a
+period mid-day, so a total read from raw events with exact instants can differ on a unit's first
+day and at the edges of the period. Filter such rows by day (`day >= joinedDay`) and say so in
+the dataset's description, or compute the exact number in a `resolve` metric.
 
 **Result types are honest.** `count` measures are `number`; `sum`, `avg` and `median` are
 `number | null`; `share` and `ratio` are a branded `Ratio | null` (0-1). A row has a field only
@@ -592,6 +748,27 @@ const main: AnalyticsSource = {
 }
 ```
 
+Each statement there is an interactive transaction: five round trips (begin, two `SET`s, the
+query, commit). One round trip does the same when the connection itself is read-only with a
+timeout, for example a role made for analytics:
+
+```sql
+CREATE ROLE analytics_reader LOGIN PASSWORD '...';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO analytics_reader;
+ALTER ROLE analytics_reader SET default_transaction_read_only = on;
+ALTER ROLE analytics_reader SET statement_timeout = '5s';
+```
+
+```ts
+const analyticsDb = new PrismaClient({ datasourceUrl: process.env.ANALYTICS_DATABASE_URL })
+const main: AnalyticsSource = {
+	dialect: postgresDialect({ timestamps: 'utc' }),
+	execute: ({ text, values }) => analyticsDb.$queryRawUnsafe(text, ...values)
+}
+```
+
+`concurrency` on `createAnalytics` keeps a dashboard from taking every connection of the pool.
+
 **`measurr/clickhouse`** `clickhouseDialect()`: typed `{pN:Type}` parameters, backquoted
 identifiers, `-If` and `-OrNull` aggregates (an empty group is null, as in Postgres), an exact
 interpolated median, `uniqExact` for distinct counts, and buckets with `toTimeZone`. Every
@@ -652,6 +829,17 @@ list are refused with `forbidden`. Every other check runs as usual.
 await assertDatasetContract({ dataset: maintenance, source, tenant: allTenants })
 ```
 
+`assertMetricContract({ registry, ctx })` runs every metric of a registry once over the last 30
+days (or `period`), comparing with the previous period, and fails when one errors, draws
+another kind than it declares, or a metric over a time range has no previous period. Give it a
+`ctx` that `canRun` allows everything for, scoped to a seeded tenant.
+
+```ts
+import { assertMetricContract } from 'measurr/testing'
+
+await assertMetricContract({ registry: metrics, ctx: seededOwner })
+```
+
 ## Extending
 
 - **A measure or dimension** is one entry in a dataset. Dimensions are groupable and
@@ -677,13 +865,16 @@ Kept stable for publishing: `createAnalytics` and its options (with `authorize`,
 `Dialect`, `SqlRenderer` and `AnalyticsSource` contracts; `measure.resolved` with the
 `resolvers` option (`MeasureResolver`, `ResolverInput`, `ResolverOutput`); `postgresDialect`,
 `clickhouseDialect` and `toQueryParams`,
-`checkDatasetContract` / `assertDatasetContract`; `measurr/shapes` (`toKpi`, `toTimeseries`,
+`checkDatasetContract` / `assertDatasetContract`, `analytics.period` and `analytics.scope`,
+the query options (`totals`, `signal`) and the `maxLimit` and `concurrency` options, result
+`fields`, dimension `lookup`; `measurr/shapes` (`toKpi`, `toTimeseries`,
 `toDistribution`, `toPivot`, `toLeaderboard`) and `measurr/handler` (`queryBatch`,
 `streamBatch`, `toHttpError`); and the types `AnalyticsQuery`, `AnalyticsResult`,
 `ResultPeriod`, `PeriodInput`, `Tenant`, `TenantId`, `AccessKey`, `AnalyticsCache`, `FieldKey`,
 `Ratio`, `AnalyticsError` codes and their details (`isAnalyticsError`). `ExprNode` and
 `SelectStatement` are exported for dialect authors and may grow new node kinds. The
-presenters and wire outputs in `measurr/shapes`, `measurr/metrics` and `analytics.timezone`
+presenters and wire outputs in `measurr/shapes`, `measurr/metrics` (with `resolve` metrics and
+the output schemas), `checkMetricContract` / `assertMetricContract` and `analytics.timezone`
 are new and may still change before they join this list.
 
 ## Install
@@ -692,7 +883,7 @@ are new and may still change before they join this list.
 npm install measurr zod
 ```
 
-`zod` 4 is a peer dependency. The types need TypeScript 6 or newer.
+`zod` 4 is a peer dependency. The types need TypeScript 5.9 or newer.
 
 ## Development
 

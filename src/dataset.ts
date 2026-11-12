@@ -328,11 +328,19 @@ export type EnumDimension<
 	readonly empty: string | undefined
 }
 
+/** Where an open dimension's values are looked up: their own table, scoped by its column. */
+export type DimensionLookup = {
+	readonly table: TableRef
+	/** Null for a table every tenant shares. */
+	readonly tenantColumn: ExprNode | null
+}
+
 export type RelationDimension<K = unknown> = DimensionBase<'open', K> & {
 	readonly kind: 'relation'
 	readonly key: ExprNode
 	readonly name: ExprNode
 	readonly empty: string | undefined
+	readonly lookup: DimensionLookup | undefined
 }
 
 export type ManyToManyDimension = DimensionBase<'open', string> & {
@@ -343,6 +351,7 @@ export type ManyToManyDimension = DimensionBase<'open', string> & {
 	readonly name: ExprNode
 	readonly empty: string | undefined
 	readonly note: string | undefined
+	readonly lookup: DimensionLookup | undefined
 }
 
 export type NumberDimension = DimensionBase<'numeric', number> & {
@@ -445,6 +454,35 @@ function withAccess<
 	return dimension as D & DimensionAccess<G, F, Access>
 }
 
+/**
+ * Reads a filter's names from the dimension's own table instead of from every fact row of
+ * the tenant. `tenantColumn` scopes that table; null when every tenant shares it. The key and
+ * the name must be columns of that table.
+ */
+type LookupOption = { tenantColumn: Expr<SqlType> | null } | undefined
+
+function lookupOf(
+	label: string,
+	key: Expr<SqlType>,
+	name: Expr<SqlType>,
+	option: LookupOption
+): DimensionLookup | undefined {
+	if (!option) return undefined
+	const tenantColumn = option.tenantColumn?.node ?? null
+	const columns = [key.node, name.node, ...(tenantColumn ? [tenantColumn] : [])]
+	const [first] = columns
+	const table = first?.kind === 'column' ? first.table : undefined
+	if (
+		!table ||
+		columns.some((node) => node.kind !== 'column' || node.table !== table)
+	) {
+		throw new Error(
+			`${label}: lookup needs the key, the name and the tenant column to be columns of one table`
+		)
+	}
+	return { table, tenantColumn }
+}
+
 export const dimension = {
 	/**
 	 * A column holding one value of a closed set, such as a Prisma enum. `labels` must name
@@ -524,6 +562,7 @@ export const dimension = {
 			key: Expr<Key extends number ? 'number' : 'string', Key | null>
 			name: Expr<'string'>
 			empty?: string | undefined
+			lookup?: LookupOption
 		}
 	): RelationDimension<Key> & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
@@ -532,7 +571,8 @@ export const dimension = {
 			kind: 'relation',
 			key: options.key.node,
 			name: options.name.node,
-			empty: options.empty
+			empty: options.empty,
+			lookup: lookupOf(options.label, options.key, options.name, options.lookup)
 		})
 	},
 
@@ -560,6 +600,7 @@ export const dimension = {
 			/** Explains the overlap to the reader of a grouped result. */
 			note?: string | undefined
 			empty?: string | undefined
+			lookup?: LookupOption
 		}
 	): ManyToManyDimension & DimensionAccess<G, F, NoInfer<Access>> {
 		return withAccess(options, {
@@ -571,7 +612,13 @@ export const dimension = {
 			key: options.through.key.node,
 			name: options.through.name.node,
 			empty: options.empty,
-			note: options.note
+			note: options.note,
+			lookup: lookupOf(
+				options.label,
+				options.through.key,
+				options.through.name,
+				options.lookup
+			)
 		})
 	},
 
