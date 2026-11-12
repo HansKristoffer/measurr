@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/HansKristoffer/measurr/compare/v0.8.0...v0.9.0) (2026-11-12)
+
+
+### Features
+
+* shared statements, rows from an API and stricter query types ([#16](https://github.com/HansKristoffer/measurr/issues/16)) ([4dccfa1](https://github.com/HansKristoffer/measurr/commit/4dccfa1d95fbdeda4422d40cbaf6824444838f4e))
+
 ## [0.8.0](https://github.com/HansKristoffer/measurr/compare/v0.7.0...v0.8.0) (2026-11-12)
 
 
