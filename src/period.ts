@@ -106,6 +106,11 @@ export function localDate(instant: Date, timezone: string): string {
 	return formatDate(Date.UTC(p.year, p.month - 1, p.day))
 }
 
+/** The hour of the day (0-23) of `instant` in `timezone`. */
+export function localHour(instant: Date, timezone: string): number {
+	return localParts(instant, timezone).hour
+}
+
 /** The instant local midnight starts on `date` in `timezone` (handles DST changes). */
 export function startOfLocalDay(date: string, timezone: string): Date {
 	const wallClock = parseDate(date)
@@ -134,7 +139,7 @@ function daysBetween(from: string, to: string): number {
 }
 
 /** 1 = Monday ... 7 = Sunday. */
-function isoWeekday(date: string): number {
+export function isoWeekday(date: string): number {
 	const day = new Date(parseDate(date)).getUTCDay()
 
 	return day === 0 ? 7 : day

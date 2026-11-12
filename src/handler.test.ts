@@ -127,8 +127,10 @@ describe('cancelling a batch', () => {
 				main: {
 					dialect: postgresDialect(),
 					execute: async ({ text }, options) => {
+						// Only the grouped statement is still running when the consumer stops.
+						if (!text.includes('"g_status"')) return [{ m_orders: 2 }]
 						if (options?.signal) signals.push(options.signal)
-						if (text.includes('"g_status"')) await Bun.sleep(20)
+						await Bun.sleep(20)
 						return [{ m_orders: 2 }]
 					}
 				}

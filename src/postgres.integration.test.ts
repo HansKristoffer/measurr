@@ -31,6 +31,7 @@ import {
 	sales
 } from './fixtures/orders.js'
 import { orderMetrics } from './fixtures/metrics.js'
+import { queryBatch } from './handler.js'
 import { createMetricRegistry } from './metrics.js'
 import { toTimeseries } from './shapes.js'
 import { assertDatasetContract } from './testing.js'
@@ -193,6 +194,85 @@ describe.skipIf(!url)('postgres integration', () => {
 		expect(AnalyticsResultSchema.parse(result)).toEqual(result)
 	})
 
+	test('a comparison counts what each period counts on its own', async () => {
+		const period = { from: '2026-09-08', to: '2026-10-07' }
+		const before = { from: '2026-08-09', to: '2026-09-07' }
+
+		for (const measures of [
+			['orders', 'customers', 'revenue', 'averageAmount'],
+			['medianAmount', 'refunded', 'paidShare', 'refundRate']
+		] as const) {
+			for (const groupBy of [[], ['status']] as const) {
+				const query = { dataset: 'orders', measures, groupBy } as const
+				const [compared, current, previous] = await Promise.all([
+					analytics.query(
+						{ ...query, period, compareToPrevious: true },
+						tenantA
+					),
+					analytics.query({ ...query, period }, tenantA),
+					analytics.query({ ...query, period: before }, tenantA)
+				])
+
+				expect(compared.rows).toEqual(current.rows)
+				expect(compared.totals).toEqual(current.totals)
+				expect(compared.previous.rows).toEqual(previous.rows)
+				expect(compared.previous.totals).toEqual(previous.totals)
+			}
+		}
+	})
+
+	test('queries of a batch share a statement and count what they count alone', async () => {
+		const texts: string[] = []
+		const counting = createAnalytics({
+			datasets: [orders, orderBook],
+			sources: {
+				main: {
+					dialect: source.dialect,
+					execute: (statement) => {
+						texts.push(statement.text)
+						return source.execute(statement)
+					}
+				}
+			},
+			tenant: (ctx: { tenantId: string | readonly string[] }) => ctx.tenantId,
+			now: () => NOW
+		})
+		const compared = { dataset: 'orders', compareToPrevious: true } as const
+		const queries = {
+			volume: { ...compared, measures: ['orders'] },
+			money: { ...compared, measures: ['revenue', 'averageAmount'] },
+			paid: { ...compared, measures: ['paidShare'] },
+			// A distinct count, a median and `exists`: each a statement of its own.
+			customers: { ...compared, measures: ['customers', 'medianAmount'] },
+			refunds: { ...compared, measures: ['refundRate'] },
+			byStatus: {
+				...compared,
+				measures: ['orders', 'revenue'],
+				groupBy: ['status']
+			}
+		} as const
+
+		const { results, errors } = await queryBatch(counting, queries, tenantA)
+
+		expect(errors).toEqual({})
+		// The grouped rows of each period, the two costly queries, and one for the rest.
+		expect(texts).toHaveLength(5)
+		expect(results.volume).toEqual(
+			await analytics.query(queries.volume, tenantA)
+		)
+		expect(results.money).toEqual(await analytics.query(queries.money, tenantA))
+		expect(results.paid).toEqual(await analytics.query(queries.paid, tenantA))
+		expect(results.customers).toEqual(
+			await analytics.query(queries.customers, tenantA)
+		)
+		expect(results.refunds).toEqual(
+			await analytics.query(queries.refunds, tenantA)
+		)
+		expect(results.byStatus).toEqual(
+			await analytics.query(queries.byStatus, tenantA)
+		)
+	})
+
 	test('a weekly series keys buckets the way bucketStarts fills them', async () => {
 		const result = await analytics.query(
 			{
@@ -205,8 +285,8 @@ describe.skipIf(!url)('postgres integration', () => {
 		)
 
 		expect(
-			toTimeseries(result, { bucket: 'week', unit: 'week', measure: 'orders' })
-				.series[0]?.points
+			toTimeseries(result, { bucket: 'week', measure: 'orders' }).series[0]
+				?.points
 		).toEqual([
 			{ bucket: '2026-09-14', value: 1 },
 			{ bucket: '2026-09-21', value: 0 },

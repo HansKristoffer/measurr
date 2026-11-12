@@ -52,15 +52,11 @@ export const sprays = defineDataset({
 		})
 	},
 	dimensions: {
-		placement: dimension.enum(
-			unit.col('placementType'),
-			{ OFFICE: 'OFFICE', TOILET: 'TOILET' },
-			{
-				label: 'Placement',
-				labels: { OFFICE: 'Office', TOILET: 'Toilet' },
-				empty: 'No placement'
-			}
-		),
+		placement: dimension.enum(unit.col('placementType'), {
+			label: 'Placement',
+			labels: { OFFICE: 'Office', TOILET: 'Toilet' },
+			empty: 'No placement'
+		}),
 		unit: dimension.relation({
 			label: 'Unit',
 			key: unit.col('unitId'),

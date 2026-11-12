@@ -48,6 +48,13 @@ const QUERIES = {
 		measures: ['orders', 'revenue', 'medianAmount']
 	},
 	shareAndRatio: { dataset: 'orders', measures: ['paidShare', 'refundRate'] },
+	comparedWithPrevious: {
+		dataset: 'orders',
+		measures: ['orders', 'paidShare', 'refundRate'],
+		filters: [{ dimension: 'status', op: 'notIn', values: ['OPEN'] }],
+		period: { last: { days: 7 } },
+		compareToPrevious: true
+	},
 	byStatusAndRegion: {
 		dataset: 'orders',
 		measures: ['orders', 'customers'],
@@ -153,7 +160,8 @@ describe('planner rules', () => {
 	test('every statement filters by the tenant from the hook', async () => {
 		const statements = await analytics.explain(QUERIES.weeklyComputed, ctx)
 
-		expect(statements).toHaveLength(4)
+		// The rows of each period, and one totals statement for both.
+		expect(statements).toHaveLength(3)
 		for (const statement of statements) {
 			const placeholder = /\("orders"\."tenantId" = \$(\d+)\)/.exec(
 				statement.text

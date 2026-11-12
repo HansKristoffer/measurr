@@ -49,8 +49,14 @@ function analyticsAnswering(answer: Answer) {
 						}))
 					if (grouped)
 						return (previous ? answer.previousRows : answer.rows) ?? []
-					const totals = previous ? answer.previousTotals : answer.totals
-					return totals ? [totals] : []
+					// A statement that does not group counts both periods: `p_` for the previous.
+					if (text.includes('"p_')) {
+						const before = Object.entries(answer.previousTotals ?? {}).map(
+							([alias, value]) => [alias.replace(/^m_/, 'p_'), value]
+						)
+						return [{ ...answer.totals, ...Object.fromEntries(before) }]
+					}
+					return answer.totals ? [answer.totals] : []
 				}
 			}
 		},
@@ -131,7 +137,6 @@ describe('toTimeseries', () => {
 		expect(
 			toTimeseries(result, {
 				bucket: 'day',
-				unit: 'day',
 				measure: 'orders',
 				series: 'status'
 			})
@@ -181,7 +186,6 @@ describe('toTimeseries', () => {
 
 		const [series] = toTimeseries(result, {
 			bucket: 'day',
-			unit: 'day',
 			measure: 'averageAmount',
 			fill: null
 		}).series
@@ -213,13 +217,60 @@ describe('toTimeseries', () => {
 		expect(
 			toTimeseries(result, {
 				bucket: 'month',
-				unit: 'month',
 				measure: 'orders'
 			}).series[0]?.points
 		).toEqual([
 			{ bucket: '2026-01-01', value: 1 },
 			{ bucket: '2026-03-01', value: 2 }
 		])
+	})
+})
+
+describe('the bucket unit', () => {
+	const result = {
+		period: { from: '2026-10-01', to: '2026-10-21', timezone: 'UTC' },
+		rows: [
+			{ shippedWeek: { key: '2026-10-05', label: '2026-10-05' }, orders: 2 }
+		],
+		truncated: false,
+		fields: {
+			groupBy: [
+				{
+					key: 'shippedWeek',
+					label: 'Shipped week',
+					kind: 'timeBucket' as const,
+					unit: 'week' as const
+				}
+			],
+			measures: [
+				{ key: 'orders', label: 'Orders', valueType: 'count' as const }
+			]
+		}
+	}
+
+	test('comes from the result, whatever the dimension is called', () => {
+		const output = presentTimeseries(result, {
+			bucket: 'shippedWeek',
+			measure: 'orders'
+		})
+
+		expect(output.granularity).toBe('week')
+		expect(
+			output.series[0]?.points.map((point) => [point.bucket, point.value])
+		).toEqual([
+			['2026-09-28', 0],
+			['2026-10-05', 2],
+			['2026-10-12', 0],
+			['2026-10-19', 0]
+		])
+	})
+
+	test('must be given for a result that does not describe its fields', () => {
+		const { fields: _, ...bare } = result
+		const options = { bucket: 'shippedWeek', measure: 'orders' } as const
+
+		expect(() => toTimeseries(bare, options)).toThrow('pass its unit')
+		expect(toTimeseries(bare, { ...options, unit: 'week' }).unit).toBe('week')
 	})
 })
 

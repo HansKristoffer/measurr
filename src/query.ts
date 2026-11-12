@@ -65,6 +65,9 @@ export type FilterableKey<Dm> = {
 	[K in keyof Dm & string]: Dm[K] extends { filterable: false } ? never : K
 }[keyof Dm & string]
 
+/** What a conditional filter leaves behind (`status && { ... }`); `query` drops these. */
+type Skipped = false | null | undefined | 0 | ''
+
 export type DatasetFilter<Dm> = {
 	[Name in FilterableKey<Dm>]: FilterFor<Name, Dm[Name]>
 }[FilterableKey<Dm>]
@@ -76,7 +79,8 @@ export type DatasetQuery<DS> =
 				dataset: K
 				measures: readonly (keyof M & string)[]
 				groupBy?: readonly GroupableKey<Dm>[] | undefined
-				filters?: readonly DatasetFilter<Dm>[] | undefined
+				/** Every filter must match. Falsy entries are skipped, for `condition && { ... }`. */
+				filters?: readonly (DatasetFilter<Dm> | Skipped)[] | undefined
 				/** Null or omitted: the default period. */
 				period?: PeriodInput | null | undefined
 				time?: T | undefined
@@ -96,26 +100,63 @@ export type DatasetQuery<DS> =
 			}
 		: never
 
-type GroupKeys<Q> = Q extends { groupBy: readonly (infer G extends string)[] }
-	? G
-	: never
-
 type Simplify<T> = { [K in keyof T]: T[K] } & {}
 
-export type ResultRow<
-	M,
-	Dm,
-	MeasureKey extends string,
-	GroupKey extends string
-> = Simplify<
-	{ [G in GroupKey & keyof Dm]: DimensionValue<Dm[G]> } & {
-		[Key in MeasureKey & keyof M]: MeasureValue<M[Key]>
-	}
+type IsUnion<T, Whole = T> = T extends unknown
+	? [Whole] extends [T]
+		? false
+		: true
+	: never
+
+/** Every key a `measures` or `groupBy` list `L` may hold. */
+type Listed<L> = L extends readonly (infer K extends string)[] ? K : never
+
+/** The keys one form of a list surely holds: the literal members of a literal list. */
+type SureOf<L> = L extends readonly unknown[]
+	? number extends L['length']
+		? never
+		: { [I in keyof L]: IsUnion<L[I]> extends true ? never : L[I] }[number]
+	: never
+
+/**
+ * The keys a list holds whatever form it takes: all of `['orders', 'revenue']`, the shared
+ * ones of `staff ? ['orders', 'margin'] : ['orders']`, and none of a `string[]` or of a list
+ * that may be left out, since nothing says which keys those hold.
+ */
+type AlwaysListed<L, K = Listed<L>> = K extends unknown
+	? [L extends unknown ? (K extends SureOf<L> ? never : true) : never] extends [
+			never
+		]
+		? K
+		: never
+	: never
+
+/** `Q`'s list under `Name`, or undefined when the query has none. */
+type ListOf<Q, Name extends 'measures' | 'groupBy'> = Name extends keyof Q
+	? Q[Name]
+	: undefined
+
+/**
+ * A result row for the lists `Measures` and `Groups` of a query: a key the query surely asks
+ * for is there, and a key it may ask for is optional.
+ */
+export type ResultRow<M, Dm, Measures, Groups> = Simplify<
+	{
+		[G in AlwaysListed<Groups> & keyof Dm]: DimensionValue<Dm[G]>
+	} & {
+		[G in Exclude<Listed<Groups>, AlwaysListed<Groups>> &
+			keyof Dm]?: DimensionValue<Dm[G]>
+	} & ResultTotals<M, Measures>
 >
 
-export type ResultTotals<M, MeasureKey extends string> = Simplify<{
-	[Key in MeasureKey & keyof M]: MeasureValue<M[Key]>
-}>
+export type ResultTotals<M, Measures> = Simplify<
+	{
+		[Key in AlwaysListed<Measures> & keyof M]: MeasureValue<M[Key]>
+	} & {
+		[Key in Exclude<Listed<Measures>, AlwaysListed<Measures>> &
+			keyof M]?: MeasureValue<M[Key]>
+	}
+>
 
 /** The days a result covers: local days `from` to `to` (inclusive), or all time. */
 export type ResultPeriod =
@@ -202,21 +243,56 @@ type WithPrevious<Q, R extends { previous?: unknown }> = Q extends {
 	? R & { previous: NonNullable<R['previous']> }
 	: R
 
-/** The typed result of query `Q` against the datasets `DS`. */
+/**
+ * The typed result of query `Q` against the datasets `DS`. A query written out in place gives
+ * rows with exactly its measures and groupings; one built at runtime (a parsed request, a
+ * `string[]` of measures) gives rows whose keys are optional.
+ */
 export type ResultOf<DS, Q> =
 	DS extends Dataset<infer K, infer M, infer Dm, string, infer P>
-		? Q extends { dataset: K; measures: readonly (infer Mk extends string)[] }
+		? Q extends { dataset: K }
 			? WithPrevious<
 					Q,
 					WithTotals<
 						Q,
-						ResultRow<M, Dm, Mk, GroupKeys<Q>>,
-						ResultTotals<M, Mk>,
+						ResultRow<M, Dm, ListOf<Q, 'measures'>, ListOf<Q, 'groupBy'>>,
+						ResultTotals<M, ListOf<Q, 'measures'>>,
 						PeriodShape<QueryPeriod<Q, P>>
 					>
 				>
 			: never
 		: never
+
+/**
+ * What a query written out in place is held to, besides `DatasetQuery`:
+ * - it is checked against the dataset it names, so a mistake is reported on the property
+ *   that has it, not against every dataset at once;
+ * - `sort.by` must be one of its measures or grouped dimensions;
+ * - `compareToPrevious` is not for an all-time period, which has no previous one.
+ *
+ * `query` refuses the last two when it runs, which is where a query built at runtime is
+ * checked. A function that passes its own generic query on to `query` declares it the same
+ * way: `<const Q extends QueryRules<DS, Q> & DatasetQuery<DS>>`.
+ */
+export type QueryRules<DS, Q> = [RulesOf<DS, Q>] extends [never]
+	? unknown
+	: RulesOf<DS, Q>
+
+type RulesOf<DS, Q> = DS extends {
+	readonly key: infer K
+	readonly defaultPeriod: infer P
+}
+	? Q extends { dataset: K }
+		? DatasetQuery<DS> & {
+				sort?:
+					| { by: Listed<ListOf<Q, 'measures'>> | Listed<ListOf<Q, 'groupBy'>> }
+					| undefined
+				compareToPrevious?: [QueryPeriod<Q, P>] extends [{ all: true }]
+					? false | undefined
+					: boolean | undefined
+			}
+		: never
+	: never
 
 // ---------------------------------------------------------------------------------------------
 // Runtime schemas
@@ -367,6 +443,12 @@ export function datasetQuerySchema(
 	const [firstFilter, ...otherFilters] = filterable.map(([key, dim]) =>
 		filterSchema(key, dim)
 	)
+	const filters =
+		firstFilter &&
+		z
+			.array(z.discriminatedUnion('dimension', [firstFilter, ...otherFilters]))
+			.optional()
+			.describe('Every filter must match.')
 
 	return z
 		.object({
@@ -385,13 +467,14 @@ export function datasetQuerySchema(
 					.optional()
 					.describe([describeList(groupable), ...notes].join('\n'))
 			}),
-			...(firstFilter && {
-				filters: z
-					.array(
-						z.discriminatedUnion('dimension', [firstFilter, ...otherFilters])
-					)
-					.optional()
-					.describe('Every filter must match.')
+			...(filters && {
+				// App code may leave falsy entries (`condition && { ... }`); a model may not.
+				filters: options.parse
+					? z.preprocess(
+							(value) => (Array.isArray(value) ? value.filter(Boolean) : value),
+							filters
+						)
+					: filters
 			}),
 			// Nullable as well: LLM tool callers send null for a field they leave out.
 			period: periodSchema

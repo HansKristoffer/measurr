@@ -24,7 +24,6 @@ import { postgresDialect } from './dialects/postgres.js'
 import type { z } from 'zod'
 import {
 	type Order,
-	OrderStatus,
 	type Region,
 	type RegionId,
 	STATUS_LABELS,
@@ -170,17 +169,16 @@ describe('typed tables and expressions', () => {
 			measure.avg(order.col('status'), { label: 'x' })
 			// @ts-expect-error share over a number
 			measure.share({ label: 'x', numerator: order.col('amount') })
-			dimension.enum(toText(order.col('status')), { A: 'A', B: 'B' } as const, {
-				label: 'x',
-				// @ts-expect-error enum labels must cover every value
-				labels: { A: 'A' }
-			})
 			dimension.enum(
-				// @ts-expect-error the column holds values the enum does not list
+				// @ts-expect-error labels must name every value the column can hold
 				order.col('status'),
-				{ OPEN: 'OPEN' } as const,
 				{ label: 'x', labels: { OPEN: 'Open' } }
 			)
+			// A column typed only as text takes its values from the labels.
+			dimension.enum(toText(order.col('status')), {
+				label: 'x',
+				labels: { A: 'A' }
+			})
 			dimension.computed({
 				label: 'x',
 				// @ts-expect-error values must cover every value the expression produces
@@ -327,6 +325,104 @@ describe('queries and results', () => {
 		})
 	})
 
+	test('a query built at runtime gives rows whose keys may be absent', () => {
+		typeOnly(async () => {
+			const ctx = { tenantId: 't' }
+			const staff = Math.random() > 0.5
+			const parsed = analytics.querySchema().parse({})
+			const measures: ('orders' | 'revenue')[] = staff
+				? ['orders', 'revenue']
+				: ['orders']
+			const built = await analytics.query(
+				{
+					dataset: 'orders',
+					measures,
+					groupBy: staff ? ['status'] : undefined
+				},
+				ctx
+			)
+			expectTypeOf(built.rows[0]?.orders).toEqualTypeOf<number | undefined>()
+			expectTypeOf(built.totals.revenue).toEqualTypeOf<
+				number | null | undefined
+			>()
+			expectTypeOf(built.rows[0]?.status?.key).toEqualTypeOf<
+				'OPEN' | 'PAID' | 'REFUNDED' | undefined
+			>()
+			// @ts-expect-error never asked for
+			built.totals.customers
+
+			// One literal measure and one of two: only the literal one is surely there.
+			const which = staff ? 'revenue' : 'customers'
+			const mixed = await analytics.query(
+				{ dataset: 'orders', measures: ['orders', which] },
+				ctx
+			)
+			expectTypeOf(mixed.totals.orders).toEqualTypeOf<number>()
+			expectTypeOf(mixed.totals.revenue).toEqualTypeOf<
+				number | null | undefined
+			>()
+
+			// A parsed request may ask for anything the dataset has.
+			const row = (await analytics.query(parsed, ctx)).rows[0]
+			expectTypeOf(row?.paidShare).toEqualTypeOf<Ratio | null | undefined>()
+			expectTypeOf(row?.week?.key).toEqualTypeOf<string | null | undefined>()
+		})
+	})
+
+	test('a query written in place cannot break the rules query checks', () => {
+		typeOnly(() => {
+			const ctx = { tenantId: 't' }
+			analytics.query(
+				{
+					dataset: 'orders',
+					measures: ['orders'],
+					groupBy: ['status'],
+					sort: { by: 'status' },
+					compareToPrevious: true
+				},
+				ctx
+			)
+			analytics.query(
+				{
+					dataset: 'orders',
+					measures: ['orders'],
+					// @ts-expect-error revenue is not one of the query's measures
+					sort: { by: 'revenue' }
+				},
+				ctx
+			)
+			analytics.query(
+				{
+					dataset: 'orders',
+					measures: ['orders'],
+					period: { all: true },
+					// @ts-expect-error all time has no previous period
+					compareToPrevious: true
+				},
+				ctx
+			)
+		})
+	})
+
+	test('a function passes its generic query on with AnalyticsQuery<A, Q>', () => {
+		typeOnly(async () => {
+			const run = <const Q extends AnalyticsQuery<typeof analytics, Q>>(
+				input: Q
+			) => analytics.query(input, { tenantId: 't' })
+
+			const result = await run({
+				dataset: 'orders',
+				measures: ['orders'],
+				groupBy: ['status']
+			})
+			expectTypeOf(result.rows[0]?.status.label).toEqualTypeOf<
+				string | undefined
+			>()
+			// @ts-expect-error the rules hold through the function
+			run({ dataset: 'orders', measures: ['orders'], sort: { by: 'revenue' } })
+		})
+	})
+
 	test('time buckets are keyed by date and parts by number', () => {
 		type Result = AnalyticsResult<
 			typeof analytics,
@@ -364,7 +460,7 @@ describe('stricter definitions', () => {
 			time: { created: { column: order.col('createdAt'), label: 'Created' } },
 			measures: { orders: measure.count({ label: 'Orders' }) },
 			dimensions: {
-				status: dimension.enum(order.col('status'), OrderStatus, {
+				status: dimension.enum(order.col('status'), {
 					label: 'Status',
 					labels: STATUS_LABELS,
 					groupOnly: true
@@ -452,16 +548,15 @@ describe('nullability', () => {
 			time: { created: { column: ticket.col('createdAt'), label: 'Created' } },
 			measures: { tickets: measure.count({ label: 'Tickets' }) },
 			dimensions: {
-				priority: dimension.enum(
-					ticket.col('priority'),
-					{ LOW: 'LOW', HIGH: 'HIGH' } as const,
-					{ label: 'Priority', labels: LABELS, empty: 'No priority' }
-				),
-				kind: dimension.enum(
-					ticket.col('kind'),
-					{ BUG: 'BUG', IDEA: 'IDEA' } as const,
-					{ label: 'Kind', labels: { BUG: 'Bug', IDEA: 'Idea' } }
-				),
+				priority: dimension.enum(ticket.col('priority'), {
+					label: 'Priority',
+					labels: LABELS,
+					empty: 'No priority'
+				}),
+				kind: dimension.enum(ticket.col('kind'), {
+					label: 'Kind',
+					labels: { BUG: 'Bug', IDEA: 'Idea' }
+				}),
 				urgent: dimension.computed({
 					label: 'Urgent',
 					expr: caseWhen([[eq(ticket.col('priority'), 'HIGH'), 'yes']]),
@@ -539,6 +634,25 @@ describe('result periods', () => {
 				period: { preset: 'today' }
 			}>
 		>().toEqualTypeOf<Range>()
+	})
+
+	test('a dataset of all time compares only when the query names a range', () => {
+		typeOnly(() => {
+			both.query(
+				{
+					dataset: 'orderBook',
+					measures: ['orders'],
+					period: { last: { days: 7 } },
+					compareToPrevious: true
+				},
+				{}
+			)
+			both.query(
+				// @ts-expect-error orderBook counts all time unless the query names a period
+				{ dataset: 'orderBook', measures: ['orders'], compareToPrevious: true },
+				{}
+			)
+		})
 	})
 
 	test('a query typed only as the schema gives either', () => {

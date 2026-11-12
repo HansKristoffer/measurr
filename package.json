@@ -1,7 +1,7 @@
 {
 	"name": "measurr",
 	"version": "0.8.0",
-	"description": "A small typed semantic layer: datasets of measures and dimensions compiled to SQL for Postgres and ClickHouse, with chart shapes and dashboard metrics.",
+	"description": "A small typed semantic layer: datasets of measures and dimensions compiled to SQL for Postgres and ClickHouse, or evaluated over rows from an API, with chart shapes and dashboard metrics.",
 	"type": "module",
 	"module": "./dist/index.js",
 	"main": "./dist/index.js",
@@ -70,6 +70,12 @@
 			"import": "./dist/metrics.js",
 			"default": "./dist/metrics.js"
 		},
+		"./rows": {
+			"types": "./dist/rows.d.ts",
+			"bun": "./src/rows.ts",
+			"import": "./dist/rows.js",
+			"default": "./dist/rows.js"
+		},
 		"./testing": {
 			"types": "./dist/testing.d.ts",
 			"bun": "./src/testing.ts",
@@ -79,7 +85,7 @@
 	},
 	"scripts": {
 		"build": "rm -rf dist && bun run build:js && bun run build:types",
-		"build:js": "bun build ./src/index.ts ./src/dialects/postgres.ts ./src/dialects/clickhouse.ts ./src/shapes.ts ./src/handler.ts ./src/metrics.ts ./src/testing.ts --root ./src --outdir ./dist --target node --packages external --splitting",
+		"build:js": "bun build ./src/index.ts ./src/dialects/postgres.ts ./src/dialects/clickhouse.ts ./src/shapes.ts ./src/handler.ts ./src/metrics.ts ./src/rows.ts ./src/testing.ts --root ./src --outdir ./dist --target node --packages external --splitting",
 		"build:types": "tsgo -p tsconfig.build.json",
 		"prepublishOnly": "bun run build",
 		"test": "bun test",

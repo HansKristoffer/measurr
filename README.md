@@ -8,7 +8,8 @@ returns shaped, typed rows.
 - No SQL text in definitions: datasets are built from typed expression builders, so a
   renamed column, `avg` over a string or `between` on an enum fails typecheck.
 - Database-neutral definitions: dialects plug in through the `Dialect` interface. Postgres
-  (`measurr/postgres`) and ClickHouse (`measurr/clickhouse`) ship today.
+  (`measurr/postgres`) and ClickHouse (`measurr/clickhouse`) ship today, and `measurr/rows`
+  runs the same datasets over rows from an API or from memory.
 - Tenant-scoped by construction: the engine adds the tenant filter to every statement and
   refuses to run without a tenant. A caller can be scoped to one tenant or a list of them;
   platform admins can query every tenant only through an explicit `allTenants` value that no
@@ -65,7 +66,8 @@ export const orders = defineDataset({
 		refundRate: measure.ratio('refunded', 'orders', { label: 'Refund rate' })
 	},
 	dimensions: {
-		status: dimension.enum(order.col('status'), OrderStatus, {
+		// `labels` must name every value the column's type can hold.
+		status: dimension.enum(order.col('status'), {
 			label: 'Status',
 			labels: { OPEN: 'Open', PAID: 'Paid', REFUNDED: 'Refunded' }
 		}),
@@ -132,7 +134,8 @@ them:
 - `authorizeField(dataset, key, access, ctx)` decides which marked measures and dimensions it
   may use. A field is marked with `access`, a string your app defines (`'staff'`); unmarked
   fields are open to everyone who may query the dataset. The hook is called only for marked
-  fields, once per access key, and is required as soon as one field is marked
+  fields, once per access key (a query asks only about the fields it names), and is required
+  as soon as one field is marked
   (`createAnalytics` throws otherwise). A `ratio` also needs the access of the measures it
   divides, so a margin rate is as restricted as the margin. The hook's `access` is typed as the
   union of the keys the datasets use (`AccessKey`) and `key` as their field keys (`FieldKey`),
@@ -145,14 +148,14 @@ With them:
 - `analytics.listDatasets(ctx)` resolves to the catalog entries (measures, dimensions, closed
   values) of the datasets `ctx` may query, without the fields it may not use. A dataset with
   no measure left for `ctx` is left out.
-- `analytics.querySchema({ ctx })` resolves to the input schema for the same datasets and
+- `analytics.querySchemaFor(ctx)` resolves to the input schema for the same datasets and
   fields, for a tool built per caller, so a model is never offered what it may not use. It
   rejects with `AnalyticsError('forbidden')` when nothing is allowed.
-  `analytics.querySchema({ datasets })` is the synchronous form for a list you already have
-  (typed for those datasets only), and `querySchema()` covers every dataset and field. Schemas
-  are built once per set of datasets and fields, so `querySchema({ ctx })` returns the same
-  object as `querySchema({ datasets })` when `ctx` may use every field of the allowed set:
-  cache a tool built from it by the keys of what it offers.
+  `analytics.querySchema({ datasets })` is the schema for a list you already have (typed for
+  those datasets only), and `querySchema()` covers every dataset and field. Schemas are built
+  once per set of datasets and fields, so `querySchemaFor(ctx)` returns the same object as
+  `querySchema({ datasets })` when `ctx` may use every field of the allowed set: cache a tool
+  built from it by the keys of what it offers.
 - `analytics.query` checks all three again on every call, so a schema offered too widely still
   cannot leak a dataset or a field. Naming a field `ctx` may not use (as a measure, in
   `groupBy` or `sort`, or in a filter) fails with `AnalyticsError('forbidden')`, which names
@@ -206,8 +209,12 @@ result.fields
 - `totals: false` skips a grouped query's totals statement, and the result has no `totals`
   (its type says so). The presenters do not need them. It is for app code: `querySchema` does
   not offer it to a model, which would then add up overlapping rows.
+- `filters` skips falsy entries, so a filter can be conditional:
+  `filters: [status && { dimension: 'status', op: 'in', values: [status] }]`. Also for app
+  code only; the schema a model gets takes filters and nothing else.
 - `createAnalytics({ maxLimit })` raises the highest `limit` `query` accepts, for app code such
-  as a long time series. The schema `querySchema` builds keeps 100.
+  as a long time series (`analytics.maxLimit` reads it back). The schema `querySchema` builds
+  keeps 100.
 - `createAnalytics({ concurrency })` caps how many statements run at once on each source, so a
   large dashboard cannot take every pooled connection.
 - `signal` aborts a query: it rejects with the signal's reason, statements waiting for a slot
@@ -266,7 +273,7 @@ import { toDistribution, toKpi, toPivot, toTimeseries, toLeaderboard } from 'mea
 toKpi(result, 'orders')
 // { kind: 'kpi', value: 12, previous: 8, change: 0.5 }
 
-toTimeseries(result, { bucket: 'day', unit: 'day', measure: 'orders', series: 'status' })
+toTimeseries(result, { bucket: 'day', measure: 'orders', series: 'status' })
 // { kind: 'timeseries', unit, series: [{ key, label, points: [{ bucket: '2026-10-01', value }], previous? }] }
 
 toDistribution(result, { by: 'status', measure: 'orders' }) // segments with share of the total
@@ -275,7 +282,8 @@ toLeaderboard(result, { by: 'region', measure: 'revenue' }) // ranked rows with 
 ```
 
 - `toTimeseries` gives every bucket of the period a point; buckets without rows get `fill` (0 by
-  default, pass `null` for averages). An ungrouped series exists even for a period without rows.
+  default, pass `null` for averages). `bucket` is any time-bucket dimension the query grouped
+  by; what one bucket is (day, week, month) comes from the result's `fields`. An ungrouped series exists even for a period without rows.
   An all-time result has only the buckets it found. The previous period's points are on its own
   buckets; compare them by position.
 - `seriesKeys` (and `segmentKeys` for distributions) lists keys to draw even when no row has
@@ -338,23 +346,24 @@ caller and streams one chunk per metric.
 import { createMetricRegistry, metricDefiner } from 'measurr/metrics'
 import { presentKpi, presentTimeseries } from 'measurr/shapes'
 
-// Types only, so metric modules need not import the analytics instance.
-export const defineMetric = metricDefiner<(typeof datasets)[number], Role, {}, Ctx>()
+// Typed by the analytics instance: its datasets check `query`, its context is `run.ctx`. The
+// second parameter is the app's own fields. Types only, so nothing is imported at runtime.
+export const defineMetric = metricDefiner<
+	typeof analytics,
+	{ allowedRoles?: readonly Role[] }
+>()
 
 const orderTrend = defineMetric({
 	key: 'orders.trend',
 	kind: 'timeseries',
 	description: 'Orders over time',
 	allowedRoles: ['owner', 'member'],
-	supportsTimeRange: true, // false for a snapshot: all time, no previous period
 	filterSchema: z.object({ status: z.enum(['OPEN', 'PAID']).optional() }), // optional
 	query: ({ bucket, filters }) => ({
 		dataset: 'orders',
 		measures: ['orders'],
 		groupBy: [bucket],
-		filters: filters.status ? [{ dimension: 'status', op: 'in', values: [filters.status] }] : [],
-		limit: 100,
-		totals: false // no presenter reads them; saves a statement per period
+		filters: [filters.status && { dimension: 'status', op: 'in', values: [filters.status] }]
 	}),
 	shape: (result, { bucket }) =>
 		presentTimeseries(result, { bucket, measure: 'orders', chartType: 'bar' })
@@ -364,7 +373,7 @@ const myOpenItems = defineMetric({
 	key: 'workItems.mine',
 	kind: 'kpi',
 	description: 'Open items assigned to me',
-	supportsTimeRange: false,
+	supportsTimeRange: false, // a snapshot: all time, no previous period
 	// `ctx` is the caller; the tenant scope applies anyway.
 	query: ({ ctx }) => ({
 		dataset: 'workItems',
@@ -380,7 +389,6 @@ const seatsUsed = defineMetric({
 	key: 'billing.seats',
 	kind: 'kpi',
 	description: 'Seats in use',
-	supportsTimeRange: true,
 	resolve: async ({ period, tenant, signal }) => ({
 		kind: 'kpi',
 		value: await countSeats({ organizationIds: tenant, from: period?.start, to: period?.end, signal })
@@ -401,6 +409,8 @@ for await (const chunk of metrics.run(input, ctx, { signal: request.signal })) s
 
 const { results, errors } = await metrics.collect(input, ctx) // by request key, typed per key
 const seats = await metrics.one('billing.seats', { period: { last: { days: 7 } } }, ctx)
+// `one` checks `filters` against the metric's `filterSchema`
+const paid = await metrics.one('orders.trend', { filters: { status: 'PAID' } }, ctx)
 ```
 
 - A request names its period like a query, `period: { last: { days: 7 } }` or any other
@@ -411,7 +421,11 @@ const seats = await metrics.one('billing.seats', { period: { last: { days: 7 } }
   counts all time; a snapshot always does.
 - Every result carries the `period` it counted: `{ from, to, timezone }` or `{ all: true,
   timezone }`, so a chart can mark today without a second request.
-- `query` returns the query without `period` or `compareToPrevious`. `compareToPrevious` adds
+- `query` returns the query without `period` or `compareToPrevious`. The registry also fills
+  in what a dashboard wants: a grouped query runs without totals unless it says `totals: true`
+  (they cost a statement per period, and `shape`'s `result` has no `totals` without it), and a
+  `timeseries` or `pivot` metric that names no `limit` gets `analytics.maxLimit`, so a series
+  is cut only when it has more rows than the instance allows. `compareToPrevious` adds
   the previous period, whose series points are put on the current buckets so a chart overlays
   them. With week or month buckets the two periods can differ by a bucket: points pair from the
   end, and a previous point before the current period's first bucket is dropped.
@@ -419,8 +433,12 @@ const seats = await metrics.one('billing.seats', { period: { last: { days: 7 } }
   days, week up to 90, else month) picks `run.bucket`: `day`, `week` or `month`; `hour` draws
   days and `quarter` and `year` draw months, and the output's `granularity` says which. Name
   time-bucket dimensions after them so `groupBy: [bucket]` works.
-- `query` and `shape` get `run.ctx`, and `metricDefiner`'s fourth parameter types it. A filter
-  on the caller's own id is part of the query, so the cache key already separates users.
+- The metrics of a request that count the same rows without grouping are read in one statement
+  (see [Shared statements](#shared-statements)): a row of counts, sums and shares over one
+  dataset with the same filters costs one statement, with or without the previous period.
+  `canRun` is asked for every requested metric before any of them starts.
+- `query` and `shape` get `run.ctx`, typed as the analytics instance's context. A filter on
+  the caller's own id is part of the query, so the cache key already separates users.
 - A `resolve` metric gets the filters, bucket and granularity, the `period` (local days with
   `start` and `end` instants, or null for all time), the `tenant` from `analytics.scope(ctx)`
   (`allTenants` included), `ctx` and a `signal`. It is called once for the period and, with
@@ -430,16 +448,19 @@ const seats = await metrics.one('billing.seats', { period: { last: { days: 7 } }
   (`canRun` refused it), `invalid_filters`, `truncated`, `shape_failed`, `internal` (a driver
   error or a throwing `resolve`; the message does not say what), or the engine's codes such as
   `missing_tenant`. `onError(error, { key, requestKey, code, metric }, ctx)` hears every
-  failure with what was thrown; `onShapeError` still works and is deprecated.
+  failure with what was thrown.
 - A time series whose query was cut at its `limit` fails with `truncated` instead of drawing
-  zeros for the newest buckets. Raise its `limit` (and `maxLimit`) or ask for a shorter period.
-- `filterSchema` is optional; without it a metric takes no filters.
-- `metricDefiner<Datasets, Role, Extra, Ctx>()` takes the app's own definition fields as
-  `Extra` (catalog metadata, UI hints for filters); the registry carries them to `canRun` and
-  `available` without reading them.
+  zeros for the newest buckets. Raise `maxLimit` or ask for a shorter period.
+- `filterSchema` and `supportsTimeRange` are optional: without them a metric takes no filters
+  and counts the request's period.
+- `metricDefiner<typeof analytics, Extra>()` takes the app's own definition fields as `Extra`
+  (the roles a metric allows, catalog metadata, UI hints for filters); the registry carries
+  them to `canRun` and `available` without reading them. Where the instance cannot be
+  imported, name its type: `metricDefiner<Analytics<typeof datasets, Ctx>, Extra>()`.
 - Keys and outputs stay literal: a chunk narrows to its metric by `key`, `collect`'s results and
   `one` are typed per key, and `MetricOutputOf<typeof metrics, 'orders.trend'>`,
-  `MetricFiltersOf`, `MetricKeysOfKind` and `registry.get(key)` are typed per metric.
+  `MetricFiltersOf` (what `filterSchema` parses to), `MetricFiltersInputOf` (what a request
+  may send), `MetricKeysOfKind` and `registry.get(key)` are typed per metric.
   `registry.available(ctx)` lists what `canRun` allows, for a catalog.
 - A consumer that stops reading `run` (a closed stream) aborts the statements still running;
   `signal` does the same from outside.
@@ -477,6 +498,7 @@ customer's rows.
   query finishes, for a streaming endpoint. A consumer that stops reading aborts the statements
   still running.
 - Both take `{ signal }` as a fourth argument; aborting it rejects with the signal's reason.
+- Both read queries that count the same rows in one statement (see below).
 - `toHttpError(error)` maps an `AnalyticsError` to `{ status, code, message, data? }`:
   `forbidden` is 403 `FORBIDDEN`, `missing_tenant` 401 `UNAUTHORIZED`, the rest 400
   `BAD_REQUEST` with the code and details. The codes are the names oRPC and tRPC use:
@@ -490,6 +512,57 @@ try {
 	throw new ORPCError(code, { message, data })
 }
 ```
+
+### Shared statements
+
+Queries that run in a batch and count the same rows without grouping share a statement: the
+rows are read once, and every measure any of them asked for is computed over them. "The same
+rows" means the same dataset, filters (in any order, labels resolved to keys), period, time
+field, timezone and tenant scope. Each query is still parsed, authorized, cached and reported
+on its own, and gets only the measures it asked for.
+
+```ts
+// One statement: count(*), sum(amount) and avg(amount) over the same rows.
+const { results } = await queryBatch(
+	analytics,
+	{
+		orders: { dataset: 'orders', measures: ['orders'] },
+		revenue: { dataset: 'orders', measures: ['revenue'] },
+		average: { dataset: 'orders', measures: ['averageAmount'] }
+	},
+	ctx
+)
+```
+
+- Only measures the database computes in one pass over the rows are shared: counts, sums,
+  averages, and the shares and ratios made of them. A query with a distinct count, a median
+  or a measure that uses `exists` keeps a statement of its own. Those cost as much in a
+  shared statement as alone, and alone they run side by side on separate connections.
+- What sharing saves is database work and connections, not always time: the queries would
+  have run in parallel. On a seeded Postgres (300,000 rows read), four such numbers compared
+  with the previous period took a third to a half of the database time in one statement,
+  and about as long to come back. It pays off most when connections are scarce (a small
+  pool, `concurrency`) or each statement costs several round trips.
+- A shared statement that fails is run again for each of its queries, so a measure the
+  database refuses fails only the queries that asked for it.
+- Aborting one query leaves the statement running for the others; it stops when every query
+  it was read for has been aborted.
+- A query with a label lookup runs its statement after the lookup, without holding up the
+  rest of the batch. A query the cache answers adds nothing to a statement.
+- `minutesAgo` counts from the clock of the first query of a shared statement, a few
+  milliseconds from the others'.
+- For queries you start yourself, make a batch and start them in the same tick. Queries
+  without a batch never share a statement.
+
+```ts
+const batch = analytics.batch()
+const [orders, revenue] = await Promise.all([
+	analytics.query({ dataset: 'orders', measures: ['orders'] }, ctx, { batch }),
+	analytics.query({ dataset: 'orders', measures: ['revenue'] }, ctx, { batch })
+])
+```
+
+`analytics.explain` shows the statements a query runs on its own.
 
 ## Resolved measures
 
@@ -599,7 +672,7 @@ export const maintenance = defineDataset({
 Only a `ctx` whose `tenant(ctx)` is `allTenants` may query such a dataset, label lookups
 included. An id or a list of ids, even an empty one, fails with `AnalyticsError('forbidden')`
 before any statement runs; a narrower scope is never ignored. `listDatasets(ctx)` and
-`querySchema({ ctx })` leave the dataset out for those callers.
+`querySchemaFor(ctx)` leave the dataset out for those callers.
 
 ## The model
 
@@ -653,8 +726,8 @@ The previous period has the same length and ends the day before. Time buckets us
 timezone. `time` picks the time field the period applies to; a time dimension names its own.
 
 `{ all: true }` drops the time filter: every row counts, and time buckets and parts still group
-by the time field. It has no previous period, so `compareToPrevious` with it is an
-`invalid_query`. The result's `period` is then `{ all: true, timezone }` instead of
+by the time field. It has no previous period, so `compareToPrevious` with it fails typecheck
+when the query is written in place, and is an `invalid_query` otherwise. The result's `period` is then `{ all: true, timezone }` instead of
 `{ from, to, timezone }`; `previous.period` is always a range. The type follows the query. A
 query that names a range, or names no period on a dataset whose default is a range, gets
 `{ from, to, timezone }`, so `result.period.from` needs no narrowing. A query typed only as
@@ -669,9 +742,21 @@ every unit. The generated schema states each dataset's default, so a model knows
 
 **Totals are a separate, ungrouped statement**, so a many-to-many grouping (an order with
 two tags appears in two rows) never inflates them. Filters on many-to-many dimensions compile
-to `EXISTS`, so they never multiply rows either. A grouped query is therefore two statements
-per period, four with `compareToPrevious`, plus one per open-dimension label lookup; `totals:
-false` drops the totals statements.
+to `EXISTS`, so they never multiply rows either.
+
+**How many statements a query runs.** A query that does not group is one statement, also with
+`compareToPrevious`: the two periods are adjacent, so one statement reads both and computes
+every measure once per period. A grouped query is one statement for its rows and one for its
+totals; with `compareToPrevious` it is three, the rows of each period and one totals statement
+for both. `totals: false` drops the totals statement. Each filter that names an open
+dimension's values adds one label lookup, and the lookups run together.
+
+**Queries that run together share statements.** The metric registry, `queryBatch` and
+`streamBatch` put their queries in a batch. Queries of a batch that count the same rows without
+grouping (the same dataset, filters, period and tenant scope) are read in one statement that
+holds the counts, sums and averages of all of them, and the totals of a grouped query join it
+too. Six such numbers of a dashboard over one dataset, each compared with the previous period,
+are one statement instead of six. More on this under [Shared statements](#shared-statements).
 
 **Daily rollups cannot see part of a day.** A dataset over a table with one row per day (usage
 per unit per day) counts whole local days. It cannot start a unit at the hour it joined or end a
@@ -700,8 +785,9 @@ can be: a nullable enum column, or a `caseWhen` without `otherwise`. Name that g
 - Expressions know whether they can be null. A nullable or optional field gives a nullable
   column; `caseWhen` without `otherwise` is nullable; `coalesce` with a plain fallback is not.
   Plain operands are never null, so `eq(column, null)` fails: use `isNull`.
-- `dimension.enum` needs a label for every enum value, and fails when the column can hold a
-  value the enum does not list.
+- `dimension.enum` needs a label for every value the column's type can hold, so a new enum
+  value fails typecheck until it has one. A column typed only as `string` takes its values
+  from `labels`.
 - `dimension.computed` fails when `values` misses a value its `caseWhen` can produce.
 - `dimension.relation` takes its key type from the key column, so a branded id column types
   the key in filters and rows; `relation<number>` over a string column fails.
@@ -710,7 +796,22 @@ can be: a nullable enum column, or a `caseWhen` without `otherwise`. Name that g
 - `measure.ratio('a', 'b')` must name measures of the same dataset; time dimensions must name
   declared time fields.
 - `AnalyticsQuery<typeof analytics>` is the query union; `analytics.query` returns rows typed
-  by the query's `measures` and `groupBy`.
+  by the query's `measures` and `groupBy`. A query written out in place gives rows with
+  exactly those keys. One built at runtime (a parsed request, `measures` picked by a
+  condition) gives rows whose keys are optional, since nothing says which ones it asked for;
+  write `as const` on a list to keep its keys.
+- A query written in place is checked against its own dataset, so a mistake is reported on
+  the property that has it. Two things `query` refuses also fail typecheck there: `sort.by`
+  must be one of the query's measures or grouped dimensions, and `compareToPrevious` is not
+  for an all-time period. A metric's `query` cannot set `period` or `compareToPrevious`,
+  which the registry sets.
+- A function that passes its own generic query on keeps both with
+  `AnalyticsQuery<typeof analytics, Q>`:
+
+  ```ts
+  const run = <const Q extends AnalyticsQuery<typeof analytics, Q>>(input: Q, ctx: Ctx) =>
+  	analytics.query(input, ctx)
+  ```
 
 What the types cannot see, `defineDataset` checks when the module loads: every column is
 reachable from the dataset's table (joins, `exists` subqueries, the many-to-many link), ratio
@@ -804,6 +905,92 @@ identifiers, `FILTER (WHERE ...)`, `count(DISTINCT ...)`, `percentile_cont`, cor
 `timestamp without time zone` columns that hold UTC (Prisma's `DateTime`); the default
 `'timestamptz'` is for `timestamp with time zone`.
 
+## Rows from an API
+
+`measurr/rows` is a source for data that is not in a database: a CRM, a billing system, any
+API that returns records. Datasets are defined the same way; `rowSource` loads the rows of
+each table a statement reads and evaluates the statement in JavaScript (joins, filters,
+groups, aggregates, time buckets in the tenant's timezone), with the answers Postgres gives
+for the same rows.
+
+```ts
+import { rowSource } from 'measurr/rows'
+
+const deal = table<Deal>('deals')
+const company = deal.leftJoin(table<Company>('companies'), (c) =>
+	eq(c.col('id'), deal.col('companyId'))
+)
+
+export const deals = defineDataset({
+	key: 'deals',
+	label: 'Deals',
+	description: 'One row per deal in the CRM.',
+	from: deal,
+	source: 'crm',
+	tenantColumn: deal.col('portalId'),
+	time: { closed: { column: deal.col('closedAt'), label: 'Closed' } },
+	measures: {
+		deals: measure.count({ label: 'Deals' }),
+		value: measure.sum(deal.col('amount'), { label: 'Value' }),
+		winRate: measure.share({ label: 'Win rate', numerator: eq(deal.col('stage'), 'won') })
+	},
+	dimensions: {
+		stage: dimension.enum(deal.col('stage'), { label: 'Stage', labels: STAGE_LABELS }),
+		company: dimension.relation({ label: 'Company', key: company.col('id'), name: company.col('name') }),
+		month: dimension.timeBucket('closed', 'month')
+	}
+})
+
+const crm = rowSource({
+	// One call per table a statement reads. `filters` says which rows it needs.
+	load: async ({ table, columns, filters, signal }) => {
+		// The tenant scope: `=` for one tenant, `in` for a caller scoped to several.
+		const portal = filters.find((filter) => filter.column === 'portalId')
+		const portalId = portal?.op === '=' ? portal.value : null
+		const records = await crmClient.search(portalId, table, { properties: columns, filters, signal })
+		// Rows carry the tenant column: the source checks it again.
+		return records.map((record) => ({ ...record, portalId }))
+	}
+})
+
+createAnalytics({ datasets: [orders, deals], sources: { main, crm }, /* ... */ })
+```
+
+- **`filters` narrow what the API returns.** For a dataset's own table they are the tenant,
+  the scope, the period (`closedAt >= start`, `closedAt < end`) and the query's plain filters,
+  each as `{ column, op, value }`, `{ column, op: 'in' | 'notIn', values }` or
+  `{ column, op: 'isNull' | 'isNotNull' }`. For a joined table, or one an `exists` reads, they
+  are the keys the other rows refer to (`id in [...]`), so only the companies of the loaded
+  deals are fetched. A table no row refers to is not asked for at all.
+- **Filters are applied again to what `load` returns**, the tenant's included. A loader may
+  use the ones its API can express and ignore the rest: returning too many rows makes a query
+  slower, never wrong, and a loader that forgets the tenant returns rows that are then dropped.
+- **Values may come as the API sends them.** Timestamps as `Date`s, ISO strings (UTC when
+  they name no zone) or epoch milliseconds; numbers as numeric strings; booleans as `'true'`
+  and `'false'`.
+- **Every query reads the rows it counts.** Nothing is aggregated by the API, so this suits
+  thousands of records, with `cache` on `createAnalytics` so a dashboard does not page through
+  the API on every view, and `concurrency` to stay under its rate limit. A query's rows and
+  totals share one load, and the queries of a batch that count the same rows share a statement
+  (see [Shared statements](#shared-statements)). Sync larger data to a database and define
+  the dataset there.
+- **Differences from a database.** Text sorts by code unit, not by a locale. `exists` inside a
+  join condition is not supported (`createAnalytics` throws at startup). `analytics.explain`
+  shows each statement as the Postgres SQL it is equal to.
+
+`memorySource({ orders: [...], regions: [...] })` is the same source over arrays by table
+name, for tests and small reference data. With it the contract kit runs without a database:
+
+```ts
+import { memorySource } from 'measurr/rows'
+
+await assertDatasetContract({ dataset: orders, source: memorySource(fixtures), tenant: 'A' })
+```
+
+Name the row types and the rows are checked against them, so a misspelt column fails
+typecheck instead of counting as null: `memorySource<{ orders: Order; regions: Region }>({ ... })`.
+A row may leave columns out.
+
 ## Testing your datasets
 
 `measurr/testing` runs the same checks for every dataset against a seeded database:
@@ -859,7 +1046,7 @@ await assertMetricContract({ registry: metrics, ctx: seededOwner })
 
 Kept stable for publishing: `createAnalytics` and its options (with `authorize`,
 `authorizeField` and `cache`), `allTenants`, `analytics.query`, `explain`, `querySchema`,
-`resultSchema`, `listDatasets`; `AnalyticsResultSchema`, `analyticsToolGuidance`,
+`querySchemaFor`, `resultSchema`, `listDatasets`; `AnalyticsResultSchema`, `analyticsToolGuidance`,
 `AnalyticsQueryEvent`; `defineDataset` (with `defaultPeriod` and `tenantColumn: null`),
 `measure.*` and `dimension.*` (with `access`), `table` / `Table`, the expression builders; the
 `Dialect`, `SqlRenderer` and `AnalyticsSource` contracts; `measure.resolved` with the
@@ -870,12 +1057,13 @@ the query options (`totals`, `signal`) and the `maxLimit` and `concurrency` opti
 `fields`, dimension `lookup`; `measurr/shapes` (`toKpi`, `toTimeseries`,
 `toDistribution`, `toPivot`, `toLeaderboard`) and `measurr/handler` (`queryBatch`,
 `streamBatch`, `toHttpError`); and the types `AnalyticsQuery`, `AnalyticsResult`,
-`ResultPeriod`, `PeriodInput`, `Tenant`, `TenantId`, `AccessKey`, `AnalyticsCache`, `FieldKey`,
+`QueryRules`, `ResultPeriod`, `PeriodInput`, `Tenant`, `TenantId`, `AccessKey`, `AnalyticsCache`, `FieldKey`,
 `Ratio`, `AnalyticsError` codes and their details (`isAnalyticsError`). `ExprNode` and
 `SelectStatement` are exported for dialect authors and may grow new node kinds. The
 presenters and wire outputs in `measurr/shapes`, `measurr/metrics` (with `resolve` metrics and
 the output schemas), `checkMetricContract` / `assertMetricContract` and `analytics.timezone`
-are new and may still change before they join this list.
+are new and may still change before they join this list, and so are `analytics.batch()`,
+the `batch` query option and `measurr/rows` (`rowSource`, `memorySource`).
 
 ## Install
 

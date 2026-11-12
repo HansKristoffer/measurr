@@ -17,7 +17,6 @@ import {
 import { postgresDialect } from '../dialects/postgres.js'
 import {
 	type Order,
-	OrderStatus,
 	type OrderTag,
 	type Refund,
 	type Region,
@@ -68,7 +67,7 @@ function ordersLike<const K extends string>(key: K) {
 			refundRate: measure.ratio('refunded', 'orders', { label: 'Refund rate' })
 		},
 		dimensions: {
-			status: dimension.enum(order.col('status'), OrderStatus, {
+			status: dimension.enum(order.col('status'), {
 				label: 'Status',
 				labels: STATUS_LABELS
 			}),
