@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/HansKristoffer/measurr/compare/v0.9.0...v0.9.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* ship CHANGELOG.md in the npm package ([18bf0f2](https://github.com/HansKristoffer/measurr/commit/18bf0f282cd868d51033ce81e93e9fdfda2bd628))
+* ship CHANGELOG.md in the npm package ([43687ec](https://github.com/HansKristoffer/measurr/commit/43687ec2396b2192e28d1fc05388abb2c389c6aa))
+
 ## [0.9.0](https://github.com/HansKristoffer/measurr/compare/v0.8.0...v0.9.0) (2026-11-12)
 
 
