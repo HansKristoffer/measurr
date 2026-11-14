@@ -1,6 +1,6 @@
 {
 	"name": "measurr",
-	"version": "0.9.0",
+	"version": "0.9.1",
 	"description": "A small typed semantic layer: datasets of measures and dimensions compiled to SQL for Postgres and ClickHouse, or evaluated over rows from an API, with chart shapes and dashboard metrics.",
 	"type": "module",
 	"module": "./dist/index.js",
