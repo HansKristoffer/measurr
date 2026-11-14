@@ -29,6 +29,7 @@
 	"files": [
 		"src/**/*.ts",
 		"dist",
+		"CHANGELOG.md",
 		"!src/**/*.test.ts",
 		"!src/fixtures"
 	],
