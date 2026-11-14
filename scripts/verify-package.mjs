@@ -34,6 +34,8 @@ try {
 		'Package needs a README'
 	)
 	assert.ok(files.has('LICENSE'), 'Package needs its declared license')
+	// Agents upgrading an app read node_modules/<pkg>/CHANGELOG.md to see what changed.
+	assert.ok(files.has('CHANGELOG.md'), 'Package needs its changelog')
 	for (const file of files) {
 		assert.ok(
 			!/\.test\.[cm]?[jt]s$|\.tsbuildinfo$|\.tgz$|^src\/fixtures\//.test(file),
